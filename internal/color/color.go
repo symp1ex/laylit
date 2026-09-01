@@ -2,6 +2,7 @@ package color
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 )
 
@@ -11,6 +12,10 @@ type RGB struct {
 	R byte
 	G byte
 	B byte
+}
+
+func (rgb RGB) String() string {
+	return fmt.Sprintf("#%02X%02X%02X", rgb.R, rgb.G, rgb.B)
 }
 
 func Parse(value string) (RGB, error) {

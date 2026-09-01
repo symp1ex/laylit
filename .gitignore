@@ -1,3 +1,4 @@
 rules/
+.codegraph/
 *.exe
 AGENTS.md

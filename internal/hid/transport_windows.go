@@ -1,4 +1,4 @@
-package keyboard
+package hid
 
 import (
 	"context"
@@ -33,6 +33,10 @@ var (
 	procSetupDiDestroyDeviceInfoList     = setupAPIDLL.NewProc("SetupDiDestroyDeviceInfoList")
 	interfacePattern                     = regexp.MustCompile(`(?i)&mi_([0-9a-f]{2})`)
 )
+
+type WindowsTransport struct{}
+
+func NewWindowsTransport() *WindowsTransport { return &WindowsTransport{} }
 
 type hiddAttributes struct {
 	Size          uint32
@@ -72,7 +76,7 @@ type spDeviceInterfaceDetailDataW struct {
 	DevicePath [1]uint16
 }
 
-type hidDevice struct {
+type windowsConnection struct {
 	handle             windows.Handle
 	inputReportLength  int
 	outputReportLength int
@@ -80,14 +84,26 @@ type hidDevice struct {
 	closeErr           error
 }
 
+func (transport *WindowsTransport) Enumerate(ctx context.Context, vendorID, productID uint16) ([]Info, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return enumerateHID(vendorID, productID)
+}
+
+func (transport *WindowsTransport) Open(ctx context.Context, path string) (Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return openHID(path)
+}
+
 func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 	guid := new(windows.GUID)
 	procHidDGetHidGuid.Call(uintptr(unsafe.Pointer(guid)))
 
 	result, _, callErr := procSetupDiGetClassDevsW.Call(
-		uintptr(unsafe.Pointer(guid)),
-		0,
-		0,
+		uintptr(unsafe.Pointer(guid)), 0, 0,
 		uintptr(windows.DIGCF_PRESENT|windows.DIGCF_DEVICEINTERFACE),
 	)
 	deviceSet := windows.Handle(result)
@@ -101,10 +117,7 @@ func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 	for index := uint32(0); ; index++ {
 		interfaceData := spDeviceInterfaceData{CbSize: uint32(unsafe.Sizeof(spDeviceInterfaceData{}))}
 		ok, _, err := procSetupDiEnumDeviceInterfaces.Call(
-			uintptr(deviceSet),
-			0,
-			uintptr(unsafe.Pointer(guid)),
-			uintptr(index),
+			uintptr(deviceSet), 0, uintptr(unsafe.Pointer(guid)), uintptr(index),
 			uintptr(unsafe.Pointer(&interfaceData)),
 		)
 		if ok == 0 {
@@ -121,7 +134,6 @@ func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 		if !strings.Contains(strings.ToLower(path), pathNeedle) {
 			continue
 		}
-
 		info, err := readHIDInfo(path)
 		if err != nil {
 			return nil, fmt.Errorf("read HID metadata for %q: %w", path, err)
@@ -136,12 +148,8 @@ func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 func deviceInterfacePath(deviceSet windows.Handle, interfaceData *spDeviceInterfaceData) (string, error) {
 	var requiredSize uint32
 	ok, _, err := procSetupDiGetDeviceInterfaceDetailW.Call(
-		uintptr(deviceSet),
-		uintptr(unsafe.Pointer(interfaceData)),
-		0,
-		0,
-		uintptr(unsafe.Pointer(&requiredSize)),
-		0,
+		uintptr(deviceSet), uintptr(unsafe.Pointer(interfaceData)), 0, 0,
+		uintptr(unsafe.Pointer(&requiredSize)), 0,
 	)
 	if ok == 0 && !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
 		return "", err
@@ -154,12 +162,9 @@ func deviceInterfacePath(deviceSet windows.Handle, interfaceData *spDeviceInterf
 	detail := (*spDeviceInterfaceDetailDataW)(unsafe.Pointer(&buffer[0]))
 	detail.CbSize = uint32(unsafe.Sizeof(spDeviceInterfaceDetailDataW{}))
 	ok, _, err = procSetupDiGetDeviceInterfaceDetailW.Call(
-		uintptr(deviceSet),
-		uintptr(unsafe.Pointer(interfaceData)),
-		uintptr(unsafe.Pointer(detail)),
-		uintptr(requiredSize),
-		uintptr(unsafe.Pointer(&requiredSize)),
-		0,
+		uintptr(deviceSet), uintptr(unsafe.Pointer(interfaceData)),
+		uintptr(unsafe.Pointer(detail)), uintptr(requiredSize),
+		uintptr(unsafe.Pointer(&requiredSize)), 0,
 	)
 	if ok == 0 {
 		return "", err
@@ -175,26 +180,18 @@ func readHIDInfo(path string) (Info, error) {
 	defer windows.Close(handle)
 
 	attributes := hiddAttributes{Size: uint32(unsafe.Sizeof(hiddAttributes{}))}
-	ok, _, err := procHidDGetAttributes.Call(
-		uintptr(handle),
-		uintptr(unsafe.Pointer(&attributes)),
-	)
+	ok, _, err := procHidDGetAttributes.Call(uintptr(handle), uintptr(unsafe.Pointer(&attributes)))
 	if ok == 0 {
 		return Info{}, err
 	}
-
 	caps, err := getHIDCaps(handle)
 	if err != nil {
 		return Info{}, err
 	}
 	return Info{
-		Path:                path,
-		VendorID:            attributes.VendorID,
-		ProductID:           attributes.ProductID,
-		Release:             attributes.VersionNumber,
-		Interface:           interfaceNumberFromPath(path),
-		UsagePage:           caps.UsagePage,
-		Usage:               caps.Usage,
+		Path: path, VendorID: attributes.VendorID, ProductID: attributes.ProductID,
+		Release: attributes.VersionNumber, Interface: interfaceNumberFromPath(path),
+		UsagePage: caps.UsagePage, Usage: caps.Usage,
 		Serial:              hidString(handle, procHidDGetSerialNumberString),
 		Manufacturer:        hidString(handle, procHidDGetManufacturerString),
 		Product:             hidString(handle, procHidDGetProductString),
@@ -218,11 +215,7 @@ func interfaceNumberFromPath(path string) int {
 
 func hidString(handle windows.Handle, procedure *windows.LazyProc) string {
 	buffer := make([]uint16, 128)
-	ok, _, _ := procedure.Call(
-		uintptr(handle),
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(len(buffer)*2),
-	)
+	ok, _, _ := procedure.Call(uintptr(handle), uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)*2))
 	if ok == 0 {
 		return ""
 	}
@@ -231,10 +224,7 @@ func hidString(handle windows.Handle, procedure *windows.LazyProc) string {
 
 func getHIDCaps(handle windows.Handle) (hidpCaps, error) {
 	var preparsedData uintptr
-	ok, _, err := procHidDGetPreparsedData.Call(
-		uintptr(handle),
-		uintptr(unsafe.Pointer(&preparsedData)),
-	)
+	ok, _, err := procHidDGetPreparsedData.Call(uintptr(handle), uintptr(unsafe.Pointer(&preparsedData)))
 	if ok == 0 {
 		return hidpCaps{}, err
 	}
@@ -251,7 +241,7 @@ func getHIDCaps(handle windows.Handle) (hidpCaps, error) {
 	return caps, nil
 }
 
-func openHID(path string) (*hidDevice, error) {
+func openHID(path string) (*windowsConnection, error) {
 	handle, err := createHIDFile(path, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_FLAG_OVERLAPPED)
 	if err != nil {
 		return nil, err
@@ -261,11 +251,7 @@ func openHID(path string) (*hidDevice, error) {
 		windows.Close(handle)
 		return nil, err
 	}
-	return &hidDevice{
-		handle:             handle,
-		inputReportLength:  int(caps.InputReportByteLength),
-		outputReportLength: int(caps.OutputReportByteLength),
-	}, nil
+	return &windowsConnection{handle: handle, inputReportLength: int(caps.InputReportByteLength), outputReportLength: int(caps.OutputReportByteLength)}, nil
 }
 
 func createHIDFile(path string, access uint32, flags uint32) (windows.Handle, error) {
@@ -273,25 +259,20 @@ func createHIDFile(path string, access uint32, flags uint32) (windows.Handle, er
 	if err != nil {
 		return windows.InvalidHandle, err
 	}
-	return windows.CreateFile(
-		pathPointer,
-		access,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
-		nil,
-		windows.OPEN_EXISTING,
-		flags,
-		0,
-	)
+	return windows.CreateFile(pathPointer, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, flags, 0)
 }
 
-func (device *hidDevice) Write(ctx context.Context, report []byte) (int, error) {
+func (device *windowsConnection) InputReportLength() int  { return device.inputReportLength }
+func (device *windowsConnection) OutputReportLength() int { return device.outputReportLength }
+
+func (device *windowsConnection) Write(ctx context.Context, report []byte) (int, error) {
 	if len(report) != device.outputReportLength {
 		return 0, fmt.Errorf("output report is %d bytes; HID descriptor requires %d", len(report), device.outputReportLength)
 	}
 	return device.overlappedIO(ctx, report, windows.WriteFile)
 }
 
-func (device *hidDevice) Read(ctx context.Context, report []byte) (int, error) {
+func (device *windowsConnection) Read(ctx context.Context, report []byte) (int, error) {
 	if len(report) != device.inputReportLength {
 		return 0, fmt.Errorf("input buffer is %d bytes; HID descriptor requires %d", len(report), device.inputReportLength)
 	}
@@ -300,7 +281,7 @@ func (device *hidDevice) Read(ctx context.Context, report []byte) (int, error) {
 
 type overlappedOperation func(windows.Handle, []byte, *uint32, *windows.Overlapped) error
 
-func (device *hidDevice) overlappedIO(ctx context.Context, buffer []byte, operation overlappedOperation) (int, error) {
+func (device *windowsConnection) overlappedIO(ctx context.Context, buffer []byte, operation overlappedOperation) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -319,7 +300,6 @@ func (device *hidDevice) overlappedIO(ctx context.Context, buffer []byte, operat
 	if !errors.Is(err, windows.ERROR_IO_PENDING) {
 		return 0, err
 	}
-
 	timeout, err := contextTimeout(ctx)
 	if err != nil {
 		_ = windows.CancelIoEx(device.handle, overlapped)
@@ -361,7 +341,7 @@ func contextTimeout(ctx context.Context) (uint32, error) {
 	return uint32(milliseconds), nil
 }
 
-func (device *hidDevice) Close() error {
+func (device *windowsConnection) Close() error {
 	device.closeOnce.Do(func() {
 		if err := windows.CancelIoEx(device.handle, nil); err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) {
 			device.closeErr = err
