@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
-	"evision-rgb/internal/devices"
-	"evision-rgb/internal/hid"
+	"laylit/internal/devices"
+	"laylit/internal/hid"
 )
 
 const (

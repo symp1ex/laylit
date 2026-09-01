@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"evision-rgb/internal/layouts"
+	"laylit/internal/layouts"
 )
 
 func TestStableLayoutIDUsesAllLow32Bits(t *testing.T) {

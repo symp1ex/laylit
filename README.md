@@ -1,9 +1,11 @@
-# evision-rgb
+# Laylit
 
-Small Windows utility that shows the active keyboard input layout through a
-static RGB color on an EVision/Redragon-compatible USB HID keyboard. Version 2
-adds an event-driven automatic mode while preserving the original `info`,
-`set`, and `off` diagnostics.
+Laylit is a Windows utility that shows the active keyboard input layout through
+a static keyboard-backlight color. Its device-provider architecture is intended
+to support additional keyboard families; the current provider supports an
+EVision/Redragon-compatible USB HID keyboard. Version 2 adds an event-driven
+automatic mode while preserving the original `info`, `set`, and `off`
+diagnostics.
 
 The current EVision driver supports VID `320F`, PID `5000`. It talks directly
 to the vendor HID collection and does not require OpenRGB at runtime, a WinUSB
@@ -22,7 +24,7 @@ Keep the standard Windows HID driver installed. Do not replace it with WinUSB.
 Run without a positional command:
 
 ```powershell
-.\evision-rgb.exe
+.\laylit.exe
 ```
 
 At startup the application:
@@ -46,7 +48,7 @@ Alt/Shift modifier chord, never suppresses input, and does not infer a layout
 from the keys: the listener always reads and deduplicates the foreground
 thread's actual HKL.
 
-The production `evision-rgb.exe` is linked with the Windows GUI subsystem, so
+The production `laylit.exe` is linked with the Windows GUI subsystem, so
 the no-argument mode does not create a console window. There is no tray icon or
 other UI.
 
@@ -55,7 +57,7 @@ other UI.
 The file is stored at:
 
 ```text
-%AppData%\evision-rgb\config.json
+%AppData%\laylit\config.json
 ```
 
 Example:
@@ -91,7 +93,7 @@ not rewritten.
 Automatic-mode logs are stored at:
 
 ```text
-%LocalAppData%\evision-rgb\evision-rgb.log
+%LocalAppData%\laylit\laylit.log
 ```
 
 ## One-shot CLI
@@ -99,14 +101,14 @@ Automatic-mode logs are stored at:
 The original commands remain available:
 
 ```powershell
-.\evision-rgb.exe info
-.\evision-rgb.exe set "#FF0000"
-.\evision-rgb.exe set "00FF7F"
-.\evision-rgb.exe off
+.\laylit.exe info
+.\laylit.exe set "#FF0000"
+.\laylit.exe set "00FF7F"
+.\laylit.exe off
 
-.\evision-rgb.exe --debug info
-.\evision-rgb.exe --debug set "#FF0000"
-.\evision-rgb.exe --debug off
+.\laylit.exe --debug info
+.\laylit.exe --debug set "#FF0000"
+.\laylit.exe --debug off
 ```
 
 A GUI-subsystem build attaches to its parent console for explicit commands.
@@ -121,13 +123,13 @@ one is available.
 Production background binary:
 
 ```powershell
-go build -ldflags "-H=windowsgui" -o evision-rgb.exe ./cmd/evision-rgb
+go build -ldflags="-s -w -H=windowsgui" -trimpath -o Laylit.exe ./cmd/laylit
 ```
 
 Console/diagnostic binary, using the same application and CLI implementation:
 
 ```powershell
-go build -o evision-rgb-console.exe ./cmd/evision-rgb-console
+go build -o laylit-console.exe ./cmd/laylit-console
 ```
 
 The split is an entry-point/linker concern only. Console visibility and
@@ -136,8 +138,8 @@ diagnostic streams are not part of the application orchestration.
 ## Architecture
 
 ```text
-cmd/evision-rgb             production windowsgui composition root
-cmd/evision-rgb-console     console diagnostic composition root
+cmd/laylit                  production windowsgui composition root
+cmd/laylit-console          console diagnostic composition root
 internal/app                automatic-mode orchestration and ports
 internal/color              RGB value and HEX parsing
 internal/config             config model, merge, validation, atomic JSON file
@@ -195,8 +197,8 @@ gofmt -w cmd internal
 go vet ./...
 go test ./...
 go test -race ./...
-go build ./cmd/evision-rgb
-go build ./cmd/evision-rgb-console
+go build ./cmd/laylit
+go build ./cmd/laylit-console
 ```
 
 Tests cover HEX parsing, config creation/merge/validation/idempotence, fake-only

@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/config"
-	"evision-rgb/internal/devices"
-	"evision-rgb/internal/layouts"
+	"laylit/internal/color"
+	"laylit/internal/config"
+	"laylit/internal/devices"
+	"laylit/internal/layouts"
 )
 
 func TestRuntimeAppliesInitialAndSequentialLayoutChanges(t *testing.T) {

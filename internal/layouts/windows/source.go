@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"evision-rgb/internal/layouts"
 	"golang.org/x/sys/windows"
+	"laylit/internal/layouts"
 )
 
 const (
@@ -172,7 +172,7 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	className, _ := windows.UTF16PtrFromString(fmt.Sprintf("EVisionRGB.LayoutEvents.%d", windowClassSequence.Add(1)))
+	className, _ := windows.UTF16PtrFromString(fmt.Sprintf("Laylit.LayoutEvents.%d", windowClassSequence.Add(1)))
 	module, _, callErr := procGetModuleHandleW.Call(0)
 	if module == 0 {
 		ready <- win32Error("GetModuleHandle", callErr)

@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"evision-rgb/internal/entry"
+	"laylit/internal/entry"
 )
 
 func main() {

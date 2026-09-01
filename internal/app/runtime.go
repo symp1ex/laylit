@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/config"
-	"evision-rgb/internal/devices"
-	"evision-rgb/internal/layouts"
+	"laylit/internal/color"
+	"laylit/internal/config"
+	"laylit/internal/devices"
+	"laylit/internal/layouts"
 )
 
 type DeviceOpener interface {

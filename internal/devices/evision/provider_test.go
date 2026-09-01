@@ -3,7 +3,7 @@ package evision
 import (
 	"testing"
 
-	"evision-rgb/internal/hid"
+	"laylit/internal/hid"
 )
 
 func TestRGBCandidateDoesNotConstrainUsageID(t *testing.T) {

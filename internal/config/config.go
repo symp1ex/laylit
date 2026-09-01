@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sort"
 
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/layouts"
+	"laylit/internal/color"
+	"laylit/internal/layouts"
 )
 
 const (

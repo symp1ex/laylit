@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"evision-rgb/internal/layouts"
+	"laylit/internal/layouts"
 )
 
 func TestReconcileCreatesDefaultsForAllLayouts(t *testing.T) {

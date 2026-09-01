@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"evision-rgb/internal/color"
+	"laylit/internal/color"
 )
 
 var ErrNotFound = errors.New("supported RGB device not found")

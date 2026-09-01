@@ -128,7 +128,7 @@ type probeState struct {
 }
 
 func startProbe(logger *log.Logger) (*probeState, error) {
-	className, err := windows.UTF16PtrFromString(fmt.Sprintf("EVisionRGB.LayoutProbe.%d", os.Getpid()))
+	className, err := windows.UTF16PtrFromString(fmt.Sprintf("Laylit.LayoutProbe.%d", os.Getpid()))
 	if err != nil {
 		return nil, err
 	}

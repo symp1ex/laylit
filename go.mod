@@ -1,4 +1,4 @@
-module evision-rgb
+module laylit
 
 go 1.26.0
 

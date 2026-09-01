@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/hid"
+	"laylit/internal/color"
+	"laylit/internal/hid"
 )
 
 func TestDeviceSetColorWritesExactReportThenReadsAcknowledgement(t *testing.T) {

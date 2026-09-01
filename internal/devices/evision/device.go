@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/hid"
+	"laylit/internal/color"
+	"laylit/internal/hid"
 )
 
 type Device struct {

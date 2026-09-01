@@ -13,14 +13,14 @@ import (
 	"strings"
 	"syscall"
 
-	"evision-rgb/internal/app"
-	"evision-rgb/internal/color"
-	"evision-rgb/internal/config"
-	"evision-rgb/internal/devices"
-	"evision-rgb/internal/devices/evision"
-	"evision-rgb/internal/hid"
-	windowslayouts "evision-rgb/internal/layouts/windows"
-	"evision-rgb/internal/winconsole"
+	"laylit/internal/app"
+	"laylit/internal/color"
+	"laylit/internal/config"
+	"laylit/internal/devices"
+	"laylit/internal/devices/evision"
+	"laylit/internal/hid"
+	windowslayouts "laylit/internal/layouts/windows"
+	"laylit/internal/winconsole"
 )
 
 func Main(args []string, attachForCommands bool) int {
@@ -37,15 +37,15 @@ func Main(args []string, attachForCommands bool) int {
 }
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("evision-rgb", flag.ContinueOnError)
+	flags := flag.NewFlagSet("laylit", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	debug := flags.Bool("debug", false, "show HID discovery, layout, and report diagnostics")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  evision-rgb [--debug]")
-		fmt.Fprintln(stderr, "  evision-rgb [--debug] info")
-		fmt.Fprintln(stderr, "  evision-rgb [--debug] set <RRGGBB|#RRGGBB>")
-		fmt.Fprintln(stderr, "  evision-rgb [--debug] off")
+		fmt.Fprintln(stderr, "  laylit [--debug]")
+		fmt.Fprintln(stderr, "  laylit [--debug] info")
+		fmt.Fprintln(stderr, "  laylit [--debug] set <RRGGBB|#RRGGBB>")
+		fmt.Fprintln(stderr, "  laylit [--debug] off")
 	}
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -159,7 +159,7 @@ func applicationConfigPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("determine user config directory: %w", err)
 	}
-	return filepath.Join(directory, "evision-rgb", "config.json"), nil
+	return filepath.Join(directory, "laylit", "config.json"), nil
 }
 
 func openLogFile() (*os.File, error) {
@@ -167,11 +167,11 @@ func openLogFile() (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("determine user log directory: %w", err)
 	}
-	directory = filepath.Join(directory, "evision-rgb")
+	directory = filepath.Join(directory, "laylit")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return nil, fmt.Errorf("create log directory %q: %w", directory, err)
 	}
-	path := filepath.Join(directory, "evision-rgb.log")
+	path := filepath.Join(directory, "laylit.log")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open log file %q: %w", path, err)
