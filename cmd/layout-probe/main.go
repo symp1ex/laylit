@@ -25,6 +25,7 @@ const (
 	wmDestroy                = 0x0002
 	wmInputLangChangeRequest = 0x0050
 	wmInputLangChange        = 0x0051
+	wmKeyboardChordCompleted = 0x8001
 	hshelLHighBit            = 0x8000
 )
 
@@ -119,6 +120,7 @@ type probeState struct {
 	listenerTID   uint32
 	lastID        string
 	tsf           *tsfProbe
+	keyboard      *keyboardProbe
 	deregistered  bool
 	className     *uint16
 	module        uintptr
@@ -177,10 +179,20 @@ func startProbe(logger *log.Logger) (*probeState, error) {
 		return nil, err
 	}
 	state.tsf = tsf
+	keyboard, err := startKeyboardProbe(state)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	state.keyboard = keyboard
 	return state, nil
 }
 
 func (state *probeState) close() {
+	if state.keyboard != nil {
+		state.keyboard.close()
+		state.keyboard = nil
+	}
 	if state.tsf != nil {
 		state.tsf.close()
 		state.tsf = nil
@@ -218,6 +230,9 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			state.logWindowMessage("wm-inputlangchange", message, wParam, 0, false, lParam)
 			state.publishCurrent("wm-inputlangchange")
 			return 1
+		case wmKeyboardChordCompleted:
+			state.logSnapshot("keyboard-chord-completed", fmt.Sprintf("vk=0x%X keyboard_message=0x%X", wParam, lParam))
+			state.publishCurrent("keyboard-alt-shift-completed")
 		}
 	}
 

@@ -31,6 +31,7 @@ func TestDeliveredShellAndInputLanguageMessagesRequestResynchronization(t *testi
 	}{
 		{name: "registered Shell message", message: shellMessage, want: true},
 		{name: "input language change", message: wmInputLangChange, want: true},
+		{name: "completed keyboard chord", message: wmKeyboardChordCompleted, want: true},
 		{name: "unrelated window message", message: 0x0400, want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -38,6 +39,46 @@ func TestDeliveredShellAndInputLanguageMessagesRequestResynchronization(t *testi
 				t.Fatalf("isLayoutResynchronizationMessage(0x%X) = %t, want %t", test.message, got, test.want)
 			}
 		})
+	}
+}
+
+func TestKeyboardChordSignalsWhenAltShiftIsFullyReleased(t *testing.T) {
+	state := &keyboardChordState{}
+	sequence := []struct {
+		virtualKey uint32
+		message    uintptr
+		wantSignal bool
+	}{
+		{virtualKey: vkLMenu, message: wmSysKeyDown},
+		{virtualKey: vkLShift, message: wmKeyDown},
+		{virtualKey: vkLMenu, message: wmKeyUp},
+		{virtualKey: vkLShift, message: wmKeyUp, wantSignal: true},
+	}
+	for index, event := range sequence {
+		if got := state.observe(event.virtualKey, event.message); got != event.wantSignal {
+			t.Fatalf("event %d: signal=%t, want %t", index, got, event.wantSignal)
+		}
+	}
+	if state.chordSeen {
+		t.Fatal("completed chord remained active")
+	}
+}
+
+func TestKeyboardChordIgnoresSingleModifierAndOrdinaryKeys(t *testing.T) {
+	state := &keyboardChordState{}
+	sequence := []struct {
+		virtualKey uint32
+		message    uintptr
+	}{
+		{virtualKey: vkLShift, message: wmKeyDown},
+		{virtualKey: 'A', message: wmKeyDown},
+		{virtualKey: 'A', message: wmKeyUp},
+		{virtualKey: vkLShift, message: wmKeyUp},
+	}
+	for index, event := range sequence {
+		if state.observe(event.virtualKey, event.message) {
+			t.Fatalf("event %d unexpectedly signaled", index)
+		}
 	}
 }
 

@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	wmClose              = 0x0010
-	wmDestroy            = 0x0002
-	wmInputLangChange    = 0x0051
-	localeSLocalizedName = 0x00000002
+	wmClose                  = 0x0010
+	wmDestroy                = 0x0002
+	wmInputLangChange        = 0x0051
+	wmKeyboardChordCompleted = 0x8001
+	localeSLocalizedName     = 0x00000002
 )
 
 var (
@@ -146,6 +147,7 @@ type subscription struct {
 	mu        sync.Mutex
 	loopErr   error
 	lastID    string
+	keyboard  keyboardChordState
 }
 
 func (subscription *subscription) Events() <-chan layouts.Layout { return subscription.events }
@@ -211,9 +213,16 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 		return
 	}
 	defer procDeregisterShellHookWindow.Call(hwnd)
+	keyboardHook, err := installKeyboardHook(subscription)
+	if err != nil {
+		procDestroyWindow.Call(hwnd)
+		ready <- err
+		close(subscription.done)
+		return
+	}
 
 	windowSubscriptions.Store(hwnd, windowState{subscription: subscription, shellMessage: uint32(shellMessage)})
-	subscription.debug("listener registered hwnd=0x%X shell_message=0x%X listener_tid=%d", hwnd, uint32(shellMessage), windows.GetCurrentThreadId())
+	subscription.debug("listener registered hwnd=0x%X shell_message=0x%X keyboard_hook=0x%X listener_tid=%d", hwnd, uint32(shellMessage), keyboardHook, windows.GetCurrentThreadId())
 	ready <- nil
 
 	var message msg
@@ -228,6 +237,10 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&message)))
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&message)))
+	}
+	if err := uninstallKeyboardHook(subscription, keyboardHook); err != nil {
+		subscription.setLoopError(err)
+		replaceError(subscription.errors, err)
 	}
 	close(subscription.events)
 	close(subscription.errors)
@@ -298,7 +311,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 // an HKL, and Current reads the foreground thread's actual layout. lastID keeps
 // unrelated Shell traffic from becoming duplicate layout events.
 func isLayoutResynchronizationMessage(message, shellMessage uint32) bool {
-	return message == shellMessage || message == wmInputLangChange
+	return message == shellMessage || message == wmInputLangChange || message == wmKeyboardChordCompleted
 }
 
 func (source *Source) debug(format string, args ...any) {

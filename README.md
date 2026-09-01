@@ -34,12 +34,17 @@ At startup the application:
 4. immediately applies the active layout's color;
 5. treats delivered Windows Shell notifications as event-driven signals to
    resynchronize the foreground thread's actual layout;
-6. serially applies the newest notified layout color until the process exits.
+6. uses a low-level modifier hook to request the same resynchronization after
+   Alt+Shift, which does not reliably produce a Shell notification;
+7. serially applies the newest notified layout color until the process exits.
 
 There is no timer or layout polling loop. Device writes are serialized. If
 several events arrive while HID I/O is in progress, the event adapter keeps the
 newest pending layout. A runtime `SetColor` failure is logged and the listener
-continues; startup failures are fatal.
+continues; startup failures are fatal. The Alt+Shift hook observes only the
+Alt/Shift modifier chord, never suppresses input, and does not infer a layout
+from the keys: the listener always reads and deduplicates the foreground
+thread's actual HKL.
 
 The production `evision-rgb.exe` is linked with the Windows GUI subsystem, so
 the no-argument mode does not create a console window. There is no tray icon or
@@ -207,8 +212,10 @@ overflow, RGB order, write/ack semantics, and I/O deadlines.
   interactive Windows desktop session, not Session 0 or a service. Windows does
   not document a layout-specific registered Shell notification, so the listener
   resynchronizes on every delivered Shell event and never interprets its
-  `wParam` or `lParam` as an HKL. Cross-version Windows 10/11 delivery still
-  requires integration testing.
+  `wParam` or `lParam` as an HKL. Alt+Shift is covered by a global
+  `WH_KEYBOARD_LL` modifier hook on that desktop because it can change the
+  foreground HKL without delivering a Shell event. Cross-version Windows 10/11
+  delivery still requires integration testing.
 - Windows documents that some modern IME/TSF profiles can use transient input
   locale identifiers and may not emit classic `WM_INPUTLANGCHANGE`. Classic
   keyboard layouts such as EN/RU use stable HKL identifiers; unusual IME/TSF
