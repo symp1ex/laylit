@@ -20,6 +20,7 @@ type Runtime struct {
 	Config       config.Repository
 	Devices      DeviceOpener
 	ReportError  func(error)
+	Tracef       func(string, ...any)
 	DefaultColor color.RGB
 }
 
@@ -58,7 +59,7 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 		}
 	}()
 
-	if err := applyLayout(ctx, device, settings, active, runtime.defaultColor()); err != nil {
+	if err := applyLayout(ctx, device, settings, active, runtime.defaultColor(), runtime.trace); err != nil {
 		return fmt.Errorf("apply initial layout %q: %w", active.ID, err)
 	}
 
@@ -80,7 +81,7 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 	}
 	appliedLayoutID := active.ID
 	if resynchronized.ID != appliedLayoutID {
-		if err := applyLayout(ctx, device, settings, resynchronized, runtime.defaultColor()); err != nil {
+		if err := applyLayout(ctx, device, settings, resynchronized, runtime.defaultColor(), runtime.trace); err != nil {
 			return fmt.Errorf("apply active layout after subscription %q: %w", resynchronized.ID, err)
 		}
 		appliedLayoutID = resynchronized.ID
@@ -97,13 +98,15 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 				events = nil
 				continue
 			}
+			runtime.trace("runtime event received layout_id=%s applied_layout_id=%s", layout.ID, appliedLayoutID)
 			if layout.ID == appliedLayoutID {
+				runtime.trace("runtime event layout_id=%s result=deduplicated", layout.ID)
 				continue
 			}
 			if _, known, _ := settings.Color(layout.ID); !known {
 				runtime.report(fmt.Errorf("active layout %q is absent from config; applying safe default %s until restart", layout.ID, runtime.defaultColor()))
 			}
-			if err := applyLayout(ctx, device, settings, layout, runtime.defaultColor()); err != nil {
+			if err := applyLayout(ctx, device, settings, layout, runtime.defaultColor(), runtime.trace); err != nil {
 				if ctx.Err() == nil {
 					runtime.report(fmt.Errorf("apply layout change %q: %w", layout.ID, err))
 				}
@@ -121,7 +124,7 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 	return errors.New("Windows layout subscription stopped unexpectedly")
 }
 
-func applyLayout(ctx context.Context, device devices.RGBDevice, settings config.Config, layout layouts.Layout, fallback color.RGB) error {
+func applyLayout(ctx context.Context, device devices.RGBDevice, settings config.Config, layout layouts.Layout, fallback color.RGB, tracef func(string, ...any)) error {
 	selected, known, err := settings.Color(layout.ID)
 	if err != nil {
 		return err
@@ -129,8 +132,18 @@ func applyLayout(ctx context.Context, device devices.RGBDevice, settings config.
 	if !known {
 		selected = fallback
 	}
+	if tracef != nil {
+		tracef("runtime config lookup layout_id=%s known=%t selected_rgb=%s", layout.ID, known, selected)
+		tracef("runtime SetColor start layout_id=%s rgb=%s", layout.ID, selected)
+	}
 	if err := device.SetColor(ctx, selected); err != nil {
+		if tracef != nil {
+			tracef("runtime SetColor result=error layout_id=%s rgb=%s error=%q", layout.ID, selected, err)
+		}
 		return fmt.Errorf("set device color to %s: %w", selected, err)
+	}
+	if tracef != nil {
+		tracef("runtime SetColor result=success layout_id=%s rgb=%s", layout.ID, selected)
 	}
 	return nil
 }
@@ -154,5 +167,11 @@ func (runtime *Runtime) defaultColor() color.RGB {
 func (runtime *Runtime) report(err error) {
 	if runtime.ReportError != nil {
 		runtime.ReportError(err)
+	}
+}
+
+func (runtime *Runtime) trace(format string, args ...any) {
+	if runtime.Tracef != nil {
+		runtime.Tracef(format, args...)
 	}
 }

@@ -32,7 +32,8 @@ At startup the application:
 2. creates or reconciles `config.json`;
 3. opens the registered supported RGB device;
 4. immediately applies the active layout's color;
-5. listens for Windows Shell input-language and foreground-window events;
+5. treats delivered Windows Shell notifications as event-driven signals to
+   resynchronize the foreground thread's actual layout;
 6. serially applies the newest notified layout color until the process exits.
 
 There is no timer or layout polling loop. Device writes are serialized. If
@@ -203,7 +204,11 @@ overflow, RGB order, write/ack semantics, and I/O deadlines.
 - `320F:5000` is reused by several OEM keyboards. Strict collection and report
   checks reduce risk, but each firmware revision still needs a physical test.
 - `RegisterShellHookWindow` is a desktop Shell API. The listener must run in an
-  interactive Windows desktop session, not Session 0 or a service.
+  interactive Windows desktop session, not Session 0 or a service. Windows does
+  not document a layout-specific registered Shell notification, so the listener
+  resynchronizes on every delivered Shell event and never interprets its
+  `wParam` or `lParam` as an HKL. Cross-version Windows 10/11 delivery still
+  requires integration testing.
 - Windows documents that some modern IME/TSF profiles can use transient input
   locale identifiers and may not emit classic `WM_INPUTLANGCHANGE`. Classic
   keyboard layouts such as EN/RU use stable HKL identifiers; unusual IME/TSF

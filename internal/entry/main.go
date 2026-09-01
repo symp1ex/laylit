@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"evision-rgb/internal/app"
@@ -117,13 +118,20 @@ func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) err
 	}
 	logger := log.New(logWriter, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 	logger.Printf("starting automatic mode; config=%s", configPath)
+	var debugf func(string, ...any)
+	debugWriter := logWriter
+	if debug {
+		debugf = func(format string, args ...any) { logger.Printf("DEBUG "+format, args...) }
+		debugWriter = timestampedDebugWriter{logger: logger}
+	}
 
 	transport := hid.NewWindowsTransport()
-	provider := evision.NewProvider(transport, evision.Options{Debug: debug, DebugWriter: logWriter})
+	provider := evision.NewProvider(transport, evision.Options{Debug: debug, DebugWriter: debugWriter})
 	registry := devices.NewRegistry(provider)
 	runtime := app.Runtime{
-		Layouts: windowslayouts.NewSource(), Config: config.NewFileRepository(configPath), Devices: registry,
+		Layouts: windowslayouts.NewSourceWithDebug(debugf), Config: config.NewFileRepository(configPath), Devices: registry,
 		ReportError: func(err error) { logger.Printf("runtime warning: %v", err) },
+		Tracef:      debugf,
 	}
 	if err := runtime.Run(ctx); err != nil {
 		logger.Printf("automatic mode stopped: %v", err)
@@ -131,6 +139,19 @@ func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) err
 	}
 	logger.Print("automatic mode stopped")
 	return nil
+}
+
+type timestampedDebugWriter struct {
+	logger *log.Logger
+}
+
+func (writer timestampedDebugWriter) Write(data []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if line != "" {
+			writer.logger.Print(line)
+		}
+	}
+	return len(data), nil
 }
 
 func applicationConfigPath() (string, error) {

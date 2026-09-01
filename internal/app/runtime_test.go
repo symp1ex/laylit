@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +22,16 @@ func TestRuntimeAppliesInitialAndSequentialLayoutChanges(t *testing.T) {
 		"en": {Name: "English", Color: "#112233"},
 		"ru": {Name: "Russian", Color: "#445566"},
 	}}, exists: true}
-	runtime := Runtime{Layouts: source, Config: repository, Devices: fakeOpener{device: device}}
+	var traceMu sync.Mutex
+	var trace []string
+	runtime := Runtime{
+		Layouts: source, Config: repository, Devices: fakeOpener{device: device},
+		Tracef: func(format string, args ...any) {
+			traceMu.Lock()
+			defer traceMu.Unlock()
+			trace = append(trace, fmt.Sprintf(format, args...))
+		},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -38,6 +49,19 @@ func TestRuntimeAppliesInitialAndSequentialLayoutChanges(t *testing.T) {
 	}
 	if !device.isClosed() || !source.subscription.isClosed() {
 		t.Fatal("runtime did not close device and subscription")
+	}
+	traceMu.Lock()
+	joinedTrace := strings.Join(trace, "\n")
+	traceMu.Unlock()
+	for _, want := range []string{
+		"runtime event received layout_id=ru applied_layout_id=en",
+		"runtime config lookup layout_id=ru known=true selected_rgb=#445566",
+		"runtime SetColor start layout_id=ru rgb=#445566",
+		"runtime SetColor result=success layout_id=ru rgb=#445566",
+	} {
+		if !strings.Contains(joinedTrace, want) {
+			t.Fatalf("runtime trace missing %q:\n%s", want, joinedTrace)
+		}
 	}
 }
 

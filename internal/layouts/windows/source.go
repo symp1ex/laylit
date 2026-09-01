@@ -16,13 +16,10 @@ import (
 )
 
 const (
-	wmClose               = 0x0010
-	wmDestroy             = 0x0002
-	wmInputLangChange     = 0x0051
-	hshellWindowActivated = 4
-	hshellLanguage        = 8
-	hshelLrudeActivated   = 0x8004
-	localeSLocalizedName  = 0x00000002
+	wmClose              = 0x0010
+	wmDestroy            = 0x0002
+	wmInputLangChange    = 0x0051
+	localeSLocalizedName = 0x00000002
 )
 
 var (
@@ -51,9 +48,15 @@ var (
 	windowClassSequence           atomic.Uint64
 )
 
-type Source struct{}
+type Source struct {
+	debugf func(string, ...any)
+}
 
 func NewSource() *Source { return &Source{} }
+
+func NewSourceWithDebug(debugf func(string, ...any)) *Source {
+	return &Source{debugf: debugf}
+}
 
 func (source *Source) List(ctx context.Context) ([]layouts.Layout, error) {
 	if err := ctx.Err(); err != nil {
@@ -104,7 +107,9 @@ func (source *Source) Current(ctx context.Context) (layouts.Layout, error) {
 	if hkl == 0 {
 		return layouts.Layout{}, errors.New("GetKeyboardLayout returned an empty input locale identifier")
 	}
-	return describeHKL(uintptr(hkl)), nil
+	layout := describeHKL(uintptr(hkl))
+	source.debug("current foreground_hwnd=0x%X foreground_tid=%d foreground_hkl=0x%X layout_id=%s", uintptr(hwnd), threadID, uintptr(hkl), layout.ID)
+	return layout, nil
 }
 
 func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, error) {
@@ -112,7 +117,7 @@ func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, erro
 		return nil, err
 	}
 	subscription := &subscription{
-		source: source, events: make(chan layouts.Layout, 1), errors: make(chan error, 1),
+		current: source.Current, debugf: source.debugf, events: make(chan layouts.Layout, 1), errors: make(chan error, 1),
 		done: make(chan struct{}),
 	}
 	ready := make(chan error, 1)
@@ -131,7 +136,8 @@ func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, erro
 }
 
 type subscription struct {
-	source    *Source
+	current   func(context.Context) (layouts.Layout, error)
+	debugf    func(string, ...any)
 	events    chan layouts.Layout
 	errors    chan error
 	done      chan struct{}
@@ -207,6 +213,7 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 	defer procDeregisterShellHookWindow.Call(hwnd)
 
 	windowSubscriptions.Store(hwnd, windowState{subscription: subscription, shellMessage: uint32(shellMessage)})
+	subscription.debug("listener registered hwnd=0x%X shell_message=0x%X listener_tid=%d", hwnd, uint32(shellMessage), windows.GetCurrentThreadId())
 	ready <- nil
 
 	var message msg
@@ -228,16 +235,25 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 }
 
 func (subscription *subscription) publishCurrent() {
-	current, err := subscription.source.Current(context.Background())
+	current, err := subscription.current(context.Background())
 	if err != nil {
+		subscription.debug("publish result=error error=%q", err)
 		replaceError(subscription.errors, fmt.Errorf("read active layout after Windows notification: %w", err))
 		return
 	}
 	if current.ID == subscription.lastID {
+		subscription.debug("publish layout_id=%s result=deduplicated", current.ID)
 		return
 	}
 	subscription.lastID = current.ID
 	replaceLayout(subscription.events, current)
+	subscription.debug("publish layout_id=%s result=published", current.ID)
+}
+
+func (subscription *subscription) debug(format string, args ...any) {
+	if subscription.debugf != nil {
+		subscription.debugf("layout "+format, args...)
+	}
 }
 
 func (subscription *subscription) setLoopError(err error) {
@@ -256,15 +272,12 @@ type windowState struct {
 func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	if value, ok := windowSubscriptions.Load(hwnd); ok {
 		state, stateOK := value.(windowState)
-		if stateOK && message == state.shellMessage {
-			switch wParam {
-			case hshellLanguage, hshellWindowActivated, hshelLrudeActivated:
-				state.subscription.publishCurrent()
-			}
-		}
-		if stateOK && message == wmInputLangChange {
+		if stateOK && isLayoutResynchronizationMessage(message, state.shellMessage) {
+			state.subscription.debug("notification wndproc=true message=0x%X shell_message=0x%X wparam=0x%X lparam=0x%X", message, state.shellMessage, wParam, lParam)
 			state.subscription.publishCurrent()
-			return 1
+			if message == wmInputLangChange {
+				return 1
+			}
 		}
 	}
 	switch message {
@@ -277,6 +290,21 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	}
 	result, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 	return result
+}
+
+// RegisterShellHookWindow does not document a layout-specific notification on
+// current Windows versions. Any delivered Shell event is therefore used only
+// as an event-driven resynchronization signal: its payload is never treated as
+// an HKL, and Current reads the foreground thread's actual layout. lastID keeps
+// unrelated Shell traffic from becoming duplicate layout events.
+func isLayoutResynchronizationMessage(message, shellMessage uint32) bool {
+	return message == shellMessage || message == wmInputLangChange
+}
+
+func (source *Source) debug(format string, args ...any) {
+	if source.debugf != nil {
+		source.debugf("layout "+format, args...)
+	}
 }
 
 func describeHKL(hkl uintptr) layouts.Layout {
