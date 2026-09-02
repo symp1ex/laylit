@@ -9,6 +9,9 @@ import (
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
+
+	"laylit/internal/logger"
+	"laylit/internal/logsettings"
 )
 
 const (
@@ -25,12 +28,30 @@ func runService() error {
 	if events != nil {
 		defer events.Close()
 	}
+	settings, settingsPath, err := logsettings.LoadOrCreate()
+	if err != nil {
+		if events != nil {
+			_ = events.Error(1, err.Error())
+		}
+		return err
+	}
+	logDirectory, err := applicationLogDirectory()
+	if err != nil {
+		if events != nil {
+			_ = events.Error(1, err.Error())
+		}
+		return err
+	}
+	logger.Configure(logDirectory, settings.LogLevel, settings.LogRetainDays)
+	defer logger.Shutdown(2 * time.Second)
+	logger.Laylit.Infof("service starting; settings=%s", settingsPath)
 	reportError := func(err error) {
+		logger.Laylit.Warnf("service warning: %v", err)
 		if events != nil {
 			_ = events.Error(1, err.Error())
 		}
 	}
-	return svc.Run(serviceName, serviceHandler{run: func(ctx context.Context, notifications <-chan struct{}) error {
+	err = svc.Run(serviceName, serviceHandler{run: func(ctx context.Context, notifications <-chan struct{}) error {
 		supervisor := sessionSupervisor{
 			activeConsoleSession: activePhysicalConsoleSession,
 			startHelper:          startSessionHelper,
@@ -38,6 +59,12 @@ func runService() error {
 		}
 		return supervisor.Run(ctx, notifications)
 	}})
+	if err != nil {
+		logger.Laylit.Errorf("service stopped: %v", err)
+		return err
+	}
+	logger.Laylit.Infof("service stopped")
+	return nil
 }
 
 func (handler serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {

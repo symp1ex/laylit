@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"laylit/internal/logger"
 )
 
 type helperProcess interface {
@@ -74,6 +76,7 @@ func (supervisor sessionSupervisor) Run(ctx context.Context, notifications <-cha
 			} else if !usable {
 				clearRetry()
 				if helper != nil {
+					logger.Laylit.Infof("stopping session helper for console session %d: no active console session", helper.SessionID())
 					stopped, stopErr := stopSupervisedHelper(ctx, helper, stopTimeout)
 					report(stopErr)
 					if stopped {
@@ -90,6 +93,7 @@ func (supervisor sessionSupervisor) Run(ctx context.Context, notifications <-cha
 				} else {
 					clearRetry()
 					if helper != nil {
+						logger.Laylit.Infof("stopping session helper for console session %d: active session changed to %d", helper.SessionID(), sessionID)
 						stopped, stopErr := stopSupervisedHelper(ctx, helper, stopTimeout)
 						report(stopErr)
 						if !stopped {
@@ -105,6 +109,7 @@ func (supervisor sessionSupervisor) Run(ctx context.Context, notifications <-cha
 							scheduleRetry(sessionID, false)
 						} else {
 							helper = started
+							logger.Laylit.Infof("session helper started for console session %d", sessionID)
 							reconcile = true
 							continue
 						}
@@ -123,6 +128,7 @@ func (supervisor sessionSupervisor) Run(ctx context.Context, notifications <-cha
 			if helper == nil {
 				return nil
 			}
+			logger.Laylit.Infof("stopping session helper for console session %d: service shutdown", helper.SessionID())
 			stopped, err := stopSupervisedHelper(context.Background(), helper, stopTimeout)
 			report(err)
 			if !stopped {

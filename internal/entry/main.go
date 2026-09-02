@@ -20,6 +20,7 @@ import (
 	"laylit/internal/devices/evision"
 	"laylit/internal/hid"
 	windowslayouts "laylit/internal/layouts/windows"
+	appLogger "laylit/internal/logger"
 	"laylit/internal/winconsole"
 )
 
@@ -151,6 +152,16 @@ func isSessionHelperMode(args []string) bool {
 }
 
 func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) error {
+	level := "INFO"
+	sink := func(string, string) {}
+	if debug {
+		level = "DEBUG"
+		consoleLogger := log.New(fallbackWriter, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+		sink = func(level, message string) {
+			consoleLogger.Printf("%s %s", strings.ToUpper(level), message)
+		}
+	}
+	appLogger.ConfigureRemote(level, sink)
 	return runAutomaticWithReady(ctx, debug, fallbackWriter, nil)
 }
 
@@ -159,49 +170,39 @@ func runAutomaticWithReady(ctx context.Context, debug bool, fallbackWriter io.Wr
 	if err != nil {
 		return err
 	}
-	logFile, err := openLogFile()
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	logWriter := io.Writer(logFile)
-	if debug {
-		logWriter = io.MultiWriter(logFile, fallbackWriter)
-	}
-	logger := log.New(logWriter, "", log.Ldate|log.Ltime|log.Lmicroseconds)
-	logger.Printf("starting automatic mode; config=%s", configPath)
-	var debugf func(string, ...any)
-	debugWriter := logWriter
-	if debug {
-		debugf = func(format string, args ...any) { logger.Printf("DEBUG "+format, args...) }
-		debugWriter = timestampedDebugWriter{logger: logger}
-	}
+	appLogger.Laylit.Infof("starting automatic mode; config=%s", configPath)
+	debugf, debugWriter := automaticDiagnostics(debug)
 
 	transport := hid.NewWindowsTransport()
 	provider := evision.NewProvider(transport, evision.Options{Debug: debug, DebugWriter: debugWriter})
 	registry := devices.NewRegistry(provider)
 	runtime := app.Runtime{
 		Layouts: windowslayouts.NewSourceWithDebug(debugf), Config: config.NewFileRepository(configPath), Devices: registry,
-		ReportError: func(err error) { logger.Printf("runtime warning: %v", err) },
+		ReportError: func(err error) { appLogger.Laylit.Warnf("runtime warning: %v", err) },
 		Tracef:      debugf,
 		Ready:       ready,
 	}
 	if err := runtime.Run(ctx); err != nil {
-		logger.Printf("automatic mode stopped: %v", err)
+		appLogger.Laylit.Errorf("automatic mode stopped: %v", err)
 		return err
 	}
-	logger.Print("automatic mode stopped")
+	appLogger.Laylit.Infof("automatic mode stopped")
 	return nil
 }
 
-type timestampedDebugWriter struct {
-	logger *log.Logger
+func automaticDiagnostics(enabled bool) (func(string, ...any), io.Writer) {
+	if !enabled {
+		return nil, io.Discard
+	}
+	return appLogger.Laylit.Debugf, loggerDebugWriter{}
 }
 
-func (writer timestampedDebugWriter) Write(data []byte) (int, error) {
+type loggerDebugWriter struct{}
+
+func (loggerDebugWriter) Write(data []byte) (int, error) {
 	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
 		if line != "" {
-			writer.logger.Print(line)
+			appLogger.Laylit.Debugf("%s", strings.TrimPrefix(line, "DEBUG "))
 		}
 	}
 	return len(data), nil
@@ -215,21 +216,20 @@ func applicationConfigPath() (string, error) {
 	return filepath.Join(directory, "laylit", "config.json"), nil
 }
 
-func openLogFile() (*os.File, error) {
-	directory, err := os.UserCacheDir()
+func applicationLogDirectory() (string, error) {
+	executable, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("determine user log directory: %w", err)
+		return "", fmt.Errorf("determine executable path: %w", err)
 	}
-	directory = filepath.Join(directory, "laylit")
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return nil, fmt.Errorf("create log directory %q: %w", directory, err)
-	}
-	path := filepath.Join(directory, "laylit.log")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	executable, err = filepath.Abs(executable)
 	if err != nil {
-		return nil, fmt.Errorf("open log file %q: %w", path, err)
+		return "", fmt.Errorf("make executable path absolute: %w", err)
 	}
-	return file, nil
+	return applicationLogDirectoryForExecutable(executable), nil
+}
+
+func applicationLogDirectoryForExecutable(executable string) string {
+	return filepath.Join(filepath.Dir(executable), "logs")
 }
 
 func printInfo(ctx context.Context, writer io.Writer, registry *devices.Registry) error {

@@ -5,11 +5,14 @@ package entry
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"laylit/internal/sessionipc"
 )
 
 func TestHelperCommandLinePreservesPathsWithSpaces(t *testing.T) {
@@ -61,6 +64,10 @@ func TestLifecycleNamedPipeHandshake(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	sessionID, err := currentProcessSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
 	serverDone := make(chan error, 1)
 	go func() {
 		connection, acceptErr := acceptLifecyclePipe(ctx, pipe, pipeName)
@@ -70,7 +77,15 @@ func TestLifecycleNamedPipeHandshake(t *testing.T) {
 			return
 		}
 		defer connection.Close()
-		serverDone <- awaitHelperReady(ctx, connection, nonce)
+		if _, err := readHelperHello(ctx, connection, nonce, sessionID); err != nil {
+			serverDone <- err
+			return
+		}
+		ready, err := sessionipc.ReadFrame(connection)
+		if err == nil && ready.Type != sessionipc.TypeReady {
+			err = errors.New("unexpected helper readiness frame")
+		}
+		serverDone <- err
 	}()
 
 	client, err := connectSessionPipe(ctx, pipeName)
@@ -78,10 +93,20 @@ func TestLifecycleNamedPipeHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if err := writeProtocolLine(client, helperHelloPrefix+nonce); err != nil {
+	hello, err := sessionipc.NewFrame(sessionipc.TypeHello, 0, 0, sessionipc.HelloMeta{
+		Nonce: nonce, PID: os.Getpid(), SessionID: sessionID, Role: sessionHelperRole,
+	}, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeProtocolLine(client, helperReady); err != nil {
+	if err := sessionipc.WriteFrame(client, hello); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := sessionipc.NewFrame(sessionipc.TypeReady, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionipc.WriteFrame(client, ready); err != nil {
 		t.Fatal(err)
 	}
 	select {

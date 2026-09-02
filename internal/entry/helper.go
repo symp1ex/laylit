@@ -1,20 +1,18 @@
 package entry
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"os"
+
+	"laylit/internal/logger"
+	"laylit/internal/logsettings"
+	"laylit/internal/sessionipc"
 )
 
-const (
-	helperHelloPrefix = "HELLO "
-	helperReady       = "READY"
-	helperStop        = "STOP"
-	maxProtocolLine   = 512
-)
+const sessionHelperRole = "session-helper"
 
 type helperConnection interface {
 	io.Reader
@@ -25,78 +23,88 @@ type helperConnection interface {
 type automaticRunner func(context.Context, func() error) error
 
 func runSessionHelper(pipeName, nonce string) error {
+	settings, settingsPath, err := logsettings.Load()
+	if err != nil {
+		return err
+	}
+	sessionID, err := currentProcessSessionID()
+	if err != nil {
+		return err
+	}
+	remoteLogs := logger.NewRemoteLogSender()
+	defer remoteLogs.Close()
+	logger.ConfigureRemote(settings.LogLevel, remoteLogs.Enqueue)
+	logger.Laylit.Infof("session helper starting; settings=%s", settingsPath)
+
 	connection, err := connectSessionPipe(context.Background(), pipeName)
 	if err != nil {
 		return fmt.Errorf("connect to service lifecycle pipe: %w", err)
 	}
 	defer connection.Close()
-	return serveSessionHelper(connection, nonce, func(ctx context.Context, ready func() error) error {
-		return runAutomaticWithReady(ctx, false, io.Discard, ready)
+	return serveSessionHelper(connection, nonce, sessionID, remoteLogs, func(ctx context.Context, ready func() error) error {
+		return runAutomaticWithReady(ctx, settings.DebugEnabled(), io.Discard, ready)
 	})
 }
 
-func serveSessionHelper(connection helperConnection, nonce string, run automaticRunner) error {
-	if err := writeProtocolLine(connection, helperHelloPrefix+nonce); err != nil {
+func serveSessionHelper(connection helperConnection, nonce string, sessionID uint32, remoteLogs *logger.RemoteLogSender, run automaticRunner) error {
+	hello, err := sessionipc.NewFrame(sessionipc.TypeHello, 0, 0, sessionipc.HelloMeta{
+		Nonce: nonce, PID: os.Getpid(), SessionID: sessionID, Role: sessionHelperRole,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	if err := sessionipc.WriteFrame(connection, hello); err != nil {
 		return fmt.Errorf("send helper hello: %w", err)
+	}
+
+	commands := make(chan error, 1)
+	conn := sessionipc.NewConn(connection, func(_ context.Context, frame sessionipc.Frame) {
+		if frame.Type == sessionipc.TypeStop {
+			select {
+			case commands <- nil:
+			default:
+			}
+			return
+		}
+		select {
+		case commands <- fmt.Errorf("unexpected service lifecycle frame type %d", frame.Type):
+		default:
+		}
+	})
+	if remoteLogs != nil {
+		remoteLogs.SetConnection(conn, true)
+		defer remoteLogs.ClearConnection(conn)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- conn.Serve(ctx) }()
 	runtimeDone := make(chan error, 1)
 	go func() {
 		runtimeDone <- run(ctx, func() error {
-			return writeProtocolLine(connection, helperReady)
+			ready, err := sessionipc.NewFrame(sessionipc.TypeReady, 0, 0, nil, nil)
+			if err != nil {
+				return err
+			}
+			return conn.Send(ready)
 		})
-	}()
-	commandDone := make(chan struct {
-		command string
-		err     error
-	}, 1)
-	go func() {
-		command, err := readProtocolLine(bufio.NewReaderSize(connection, maxProtocolLine))
-		commandDone <- struct {
-			command string
-			err     error
-		}{command: command, err: err}
 	}()
 
 	select {
-	case err := <-runtimeDone:
-		_ = connection.Close()
-		<-commandDone
-		return err
-	case result := <-commandDone:
+	case runtimeErr := <-runtimeDone:
+		_ = conn.Close()
+		<-serveDone
+		return runtimeErr
+	case commandErr := <-commands:
 		cancel()
 		runtimeErr := <-runtimeDone
-		if result.err != nil {
-			return errors.Join(fmt.Errorf("read service lifecycle command: %w", result.err), runtimeErr)
-		}
-		if result.command != helperStop {
-			return errors.Join(fmt.Errorf("unexpected service lifecycle command %q", result.command), runtimeErr)
-		}
-		return runtimeErr
+		_ = conn.Close()
+		<-serveDone
+		return errors.Join(commandErr, runtimeErr)
+	case serveErr := <-serveDone:
+		cancel()
+		runtimeErr := <-runtimeDone
+		return errors.Join(fmt.Errorf("read service lifecycle frame: %w", serveErr), runtimeErr)
 	}
-}
-
-func writeProtocolLine(writer io.Writer, line string) error {
-	if strings.ContainsAny(line, "\r\n") || len(line) >= maxProtocolLine {
-		return errors.New("invalid lifecycle protocol line")
-	}
-	_, err := io.WriteString(writer, line+"\n")
-	return err
-}
-
-func readProtocolLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadSlice('\n')
-	if errors.Is(err, bufio.ErrBufferFull) {
-		return "", errors.New("lifecycle protocol line is too long")
-	}
-	if err != nil {
-		return "", err
-	}
-	if len(line) > maxProtocolLine {
-		return "", errors.New("lifecycle protocol line is too long")
-	}
-	text := string(line)
-	return strings.TrimSuffix(strings.TrimSuffix(text, "\n"), "\r"), nil
 }

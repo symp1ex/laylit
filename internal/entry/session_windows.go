@@ -3,7 +3,6 @@
 package entry
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,6 +16,9 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"laylit/internal/logger"
+	"laylit/internal/sessionipc"
 )
 
 const (
@@ -24,6 +26,7 @@ const (
 	helperStartupTimeout    = 20 * time.Second
 	helperConnectRetry      = 100 * time.Millisecond
 	helperForcedExitWait    = 5 * time.Second
+	lifecyclePipeBufferSize = 1 << 20
 )
 
 func activePhysicalConsoleSession() (uint32, bool, error) {
@@ -103,11 +106,14 @@ func startSessionHelper(ctx context.Context, sessionID uint32) (helperProcess, e
 			_ = connection.Close()
 		}
 	}()
-	helper := newWindowsHelperProcess(sessionID, process, connection)
+	peer, err := readHelperHello(startupCtx, connection, nonce, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	helper := newWindowsHelperProcess(sessionID, process, connection, peer)
 	processOwned = false
 	connectionOwned = false
-	if err := awaitHelperReady(startupCtx, connection, nonce); err != nil {
-		_ = connection.SetDeadline(time.Time{})
+	if err := awaitHelperReady(startupCtx, helper); err != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		stopErr := helper.Stop(stopCtx)
 		stopCancel()
@@ -141,7 +147,7 @@ func createLifecyclePipe(name string, userSID *windows.SID) (windows.Handle, err
 		namePointer,
 		windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED|windows.FILE_FLAG_FIRST_PIPE_INSTANCE,
 		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
-		1, maxProtocolLine, maxProtocolLine, uint32(helperStartupTimeout/time.Millisecond), &attributes,
+		1, lifecyclePipeBufferSize, lifecyclePipeBufferSize, uint32(helperStartupTimeout/time.Millisecond), &attributes,
 	)
 	runtime.KeepAlive(descriptor)
 	if err != nil {
@@ -189,55 +195,39 @@ func acceptLifecyclePipe(ctx context.Context, pipe windows.Handle, name string) 
 	return file, nil
 }
 
-func awaitHelperReady(ctx context.Context, connection *os.File, nonce string) error {
+func readHelperHello(ctx context.Context, connection *os.File, nonce string, sessionID uint32) (sessionipc.HelloMeta, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := connection.SetDeadline(deadline); err != nil {
-			return fmt.Errorf("set lifecycle handshake deadline: %w", err)
+			return sessionipc.HelloMeta{}, fmt.Errorf("set lifecycle handshake deadline: %w", err)
 		}
 	}
-	watchDone := make(chan struct{})
-	watchExited := make(chan struct{})
-	go func() {
-		defer close(watchExited)
-		select {
-		case <-ctx.Done():
-			_ = connection.SetDeadline(time.Now())
-		case <-watchDone:
-		}
-	}()
-	watching := true
-	defer func() {
-		if watching {
-			close(watchDone)
-			<-watchExited
-		}
-	}()
-
-	reader := bufio.NewReaderSize(connection, maxProtocolLine)
-	hello, err := readProtocolLine(reader)
+	hello, err := sessionipc.ReadFrame(connection)
 	if err != nil {
-		return fmt.Errorf("read helper hello: %w", err)
+		return sessionipc.HelloMeta{}, fmt.Errorf("read helper hello: %w", err)
 	}
-	if hello != helperHelloPrefix+nonce {
-		return errors.New("helper lifecycle authentication failed")
+	meta, err := sessionipc.DecodeMetadata[sessionipc.HelloMeta](hello)
+	if err != nil || hello.Type != sessionipc.TypeHello || meta.Nonce != nonce || meta.SessionID != sessionID || meta.Role != sessionHelperRole || meta.PID <= 0 {
+		return sessionipc.HelloMeta{}, errors.New("helper lifecycle authentication failed")
 	}
-	ready, err := readProtocolLine(reader)
-	if err != nil {
-		return fmt.Errorf("read helper readiness: %w", err)
-	}
-	if ready != helperReady {
-		return fmt.Errorf("unexpected helper lifecycle response %q", ready)
-	}
-	close(watchDone)
-	<-watchExited
-	watching = false
 	if err := ctx.Err(); err != nil {
-		return err
+		return sessionipc.HelloMeta{}, err
 	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clear lifecycle handshake deadline: %w", err)
+		return sessionipc.HelloMeta{}, fmt.Errorf("clear lifecycle handshake deadline: %w", err)
 	}
-	return nil
+	return meta, nil
+}
+
+func awaitHelperReady(ctx context.Context, helper *windowsHelperProcess) error {
+	select {
+	case <-helper.ready:
+		return nil
+	case err := <-helper.pipeDone:
+		return fmt.Errorf("read helper readiness: %w", err)
+	case <-ctx.Done():
+		_ = helper.connection.Close()
+		return ctx.Err()
+	}
 }
 
 func createProcessInSession(token windows.Token, sessionID uint32, pipeName, nonce string) (windows.Handle, error) {
@@ -326,18 +316,35 @@ func connectSessionPipe(ctx context.Context, name string) (*os.File, error) {
 	}
 }
 
+func currentProcessSessionID() (uint32, error) {
+	var sessionID uint32
+	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &sessionID); err != nil {
+		return 0, fmt.Errorf("determine helper process session: %w", err)
+	}
+	return sessionID, nil
+}
+
 type windowsHelperProcess struct {
 	sessionID  uint32
-	connection *os.File
+	connection *sessionipc.Conn
 	done       chan struct{}
+	ready      chan struct{}
+	pipeDone   chan error
+	peer       sessionipc.HelloMeta
+	readyOnce  sync.Once
 
 	mu        sync.Mutex
 	process   windows.Handle
 	exitError error
 }
 
-func newWindowsHelperProcess(sessionID uint32, process windows.Handle, connection *os.File) *windowsHelperProcess {
-	helper := &windowsHelperProcess{sessionID: sessionID, process: process, connection: connection, done: make(chan struct{})}
+func newWindowsHelperProcess(sessionID uint32, process windows.Handle, connection *os.File, peer sessionipc.HelloMeta) *windowsHelperProcess {
+	helper := &windowsHelperProcess{
+		sessionID: sessionID, process: process, done: make(chan struct{}), ready: make(chan struct{}),
+		pipeDone: make(chan error, 1), peer: peer,
+	}
+	helper.connection = sessionipc.NewConn(connection, helper.handleFrame)
+	go helper.serve()
 	go helper.wait()
 	return helper
 }
@@ -349,6 +356,26 @@ func (helper *windowsHelperProcess) ExitError() error {
 	helper.mu.Lock()
 	defer helper.mu.Unlock()
 	return helper.exitError
+}
+
+func (helper *windowsHelperProcess) serve() {
+	helper.pipeDone <- helper.connection.Serve(context.Background())
+}
+
+func (helper *windowsHelperProcess) handleFrame(_ context.Context, frame sessionipc.Frame) {
+	switch frame.Type {
+	case sessionipc.TypeReady:
+		helper.readyOnce.Do(func() { close(helper.ready) })
+	case sessionipc.TypeLog:
+		meta, err := sessionipc.DecodeMetadata[sessionipc.LogMeta](frame)
+		if err != nil {
+			logger.Laylit.Warnf("decode remote session-helper log: %v", err)
+			return
+		}
+		logger.LogSessionHelperRemote(meta.Level, meta.Message, helper.peer.PID, helper.peer.SessionID, helper.peer.Role)
+	default:
+		logger.Laylit.Warnf("unexpected session-helper frame type %d", frame.Type)
+	}
 }
 
 func (helper *windowsHelperProcess) wait() {
@@ -377,12 +404,13 @@ func (helper *windowsHelperProcess) wait() {
 }
 
 func (helper *windowsHelperProcess) Stop(ctx context.Context) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = helper.connection.SetWriteDeadline(deadline)
+	frame, err := sessionipc.NewFrame(sessionipc.TypeStop, 0, 0, nil, nil)
+	if err != nil {
+		return err
 	}
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- writeProtocolLine(helper.connection, helperStop)
+		writeDone <- helper.connection.SendContext(ctx, frame)
 	}()
 	var writeErr error
 	select {

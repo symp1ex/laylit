@@ -1,11 +1,14 @@
 package entry
 
 import (
-	"bufio"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
+
+	appLogger "laylit/internal/logger"
+	"laylit/internal/sessionipc"
 )
 
 func TestSessionHelperStopCancelsAndWaitsForAutomaticRuntime(t *testing.T) {
@@ -15,7 +18,7 @@ func TestSessionHelperStopCancelsAndWaitsForAutomaticRuntime(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- serveSessionHelper(helper, "token", func(ctx context.Context, ready func() error) error {
+		done <- serveSessionHelper(helper, "token", 42, nil, func(ctx context.Context, ready func() error) error {
 			if err := ready(); err != nil {
 				return err
 			}
@@ -26,14 +29,23 @@ func TestSessionHelperStopCancelsAndWaitsForAutomaticRuntime(t *testing.T) {
 		})
 	}()
 
-	reader := bufio.NewReader(service)
-	if hello, err := readProtocolLine(reader); err != nil || hello != helperHelloPrefix+"token" {
-		t.Fatalf("hello = %q, %v", hello, err)
+	hello, err := sessionipc.ReadFrame(service)
+	if err != nil || hello.Type != sessionipc.TypeHello {
+		t.Fatalf("hello = %+v, %v", hello, err)
 	}
-	if ready, err := readProtocolLine(reader); err != nil || ready != helperReady {
-		t.Fatalf("ready = %q, %v", ready, err)
+	helloMeta, err := sessionipc.DecodeMetadata[sessionipc.HelloMeta](hello)
+	if err != nil || helloMeta.Nonce != "token" || helloMeta.SessionID != 42 || helloMeta.Role != sessionHelperRole {
+		t.Fatalf("hello metadata = %+v, %v", helloMeta, err)
 	}
-	if err := writeProtocolLine(service, helperStop); err != nil {
+	ready, err := sessionipc.ReadFrame(service)
+	if err != nil || ready.Type != sessionipc.TypeReady {
+		t.Fatalf("ready = %+v, %v", ready, err)
+	}
+	stop, err := sessionipc.NewFrame(sessionipc.TypeStop, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionipc.WriteFrame(service, stop); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -54,6 +66,104 @@ func TestSessionHelperStopCancelsAndWaitsForAutomaticRuntime(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("helper did not exit after automatic runtime shutdown")
+	}
+}
+
+func TestSessionHelperMultiplexesReadyLogsAndStop(t *testing.T) {
+	service, helper := net.Pipe()
+	remoteLogs := appLogger.NewRemoteLogSender()
+	defer remoteLogs.Close()
+	appLogger.ConfigureRemote("DEBUG", remoteLogs.Enqueue)
+	runtimeCanceled := make(chan struct{})
+	emitAfterReady := make(chan struct{})
+	helperDone := make(chan error, 1)
+	go func() {
+		helperDone <- serveSessionHelper(helper, "token", 7, remoteLogs, func(ctx context.Context, ready func() error) error {
+			loggingDone := make(chan struct{})
+			go func() {
+				defer close(loggingDone)
+				for index := 0; index < 100; index++ {
+					appLogger.Laylit.Debugf("concurrent message %d", index)
+				}
+			}()
+			if err := ready(); err != nil {
+				return err
+			}
+			<-loggingDone
+			<-emitAfterReady
+			appLogger.Laylit.Infof("after ready")
+			<-ctx.Done()
+			close(runtimeCanceled)
+			return nil
+		})
+	}()
+
+	hello, err := sessionipc.ReadFrame(service)
+	if err != nil || hello.Type != sessionipc.TypeHello {
+		t.Fatalf("hello = %+v, %v", hello, err)
+	}
+	ready := make(chan struct{}, 1)
+	logs := make(chan sessionipc.LogMeta, 128)
+	serviceConn := sessionipc.NewConn(service, func(_ context.Context, frame sessionipc.Frame) {
+		switch frame.Type {
+		case sessionipc.TypeReady:
+			ready <- struct{}{}
+		case sessionipc.TypeLog:
+			meta, decodeErr := sessionipc.DecodeMetadata[sessionipc.LogMeta](frame)
+			if decodeErr == nil {
+				logs <- meta
+			}
+		}
+	})
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- serviceConn.Serve(context.Background()) }()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("READY was not received")
+	}
+	close(emitAfterReady)
+	logDeadline := time.After(time.Second)
+	for {
+		select {
+		case meta := <-logs:
+			if meta.Level == "info" && meta.Message == "after ready" {
+				goto logReceived
+			}
+			if meta.Level != "debug" || !strings.HasPrefix(meta.Message, "concurrent message ") {
+				t.Fatalf("remote log = %+v", meta)
+			}
+		case <-logDeadline:
+			t.Fatal("remote log after READY was not received")
+		}
+	}
+
+logReceived:
+	stop, err := sessionipc.NewFrame(sessionipc.TypeStop, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serviceConn.Send(stop); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runtimeCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("STOP did not cancel runtime while remote logging was active")
+	}
+	select {
+	case err := <-helperDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("helper shutdown deadlocked")
+	}
+	_ = serviceConn.Close()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("service reader did not terminate")
 	}
 }
 

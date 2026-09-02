@@ -103,10 +103,14 @@ error; it is never silently rewritten. Saves use an indented JSON document and
 an atomic same-directory temporary-file replacement. An unchanged config is
 not rewritten.
 
-Automatic-mode logs are stored at:
+Machine-wide logging settings are stored next to `Laylit.exe` in
+`settings.json`. The service creates the file with `INFO` and 14-day retention
+when it is absent.
+
+Service and session-helper logs are stored at:
 
 ```text
-%LocalAppData%\laylit\laylit.log
+<Laylit.exe directory>\logs\laylit.log
 ```
 
 ## One-shot CLI
@@ -150,17 +154,17 @@ diagnostic streams are not part of the application orchestration.
 
 ## Windows service installation
 
-Build `Laylit.exe`, keep it next to `install-service.bat`, and run an elevated
+Build `Laylit.exe`, keep it next to `service-cfg.bat`, and run an elevated
 Command Prompt or PowerShell in that directory. The editable service settings
 (`SERVICE_NAME`, display name, description, executable path, and start type)
 are grouped at the top of the script. `SERVICE_NAME` must remain equal to the
 Go runtime service name, `Laylit`.
 
 ```powershell
-.\install-service.bat install
-.\install-service.bat start
-.\install-service.bat stop
-.\install-service.bat uninstall
+.\service-cfg.bat install
+.\service-cfg.bat start
+.\service-cfg.bat stop
+.\service-cfg.bat uninstall
 ```
 
 The registered `binPath` is equivalent to `"C:\path\to\Laylit.exe" -service`,
