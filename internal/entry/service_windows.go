@@ -5,10 +5,10 @@ package entry
 import (
 	"context"
 	"errors"
-	"io"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 )
 
 const (
@@ -17,15 +17,27 @@ const (
 )
 
 type serviceHandler struct {
-	run func(context.Context) error
+	run func(context.Context, <-chan struct{}) error
 }
 
 func runService() error {
-	return svc.Run(serviceName, serviceHandler{
-		run: func(ctx context.Context) error {
-			return runAutomatic(ctx, false, io.Discard)
-		},
-	})
+	events, _ := eventlog.Open(serviceName)
+	if events != nil {
+		defer events.Close()
+	}
+	reportError := func(err error) {
+		if events != nil {
+			_ = events.Error(1, err.Error())
+		}
+	}
+	return svc.Run(serviceName, serviceHandler{run: func(ctx context.Context, notifications <-chan struct{}) error {
+		supervisor := sessionSupervisor{
+			activeConsoleSession: activePhysicalConsoleSession,
+			startHelper:          startSessionHelper,
+			reportError:          reportError,
+		}
+		return supervisor.Run(ctx, notifications)
+	}})
 }
 
 func (handler serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {
@@ -33,12 +45,13 @@ func (handler serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequ
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	notifications := make(chan struct{}, 1)
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- handler.run(ctx)
+		runDone <- handler.run(ctx, notifications)
 	}()
 
-	status := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	status := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}
 	statuses <- status
 	for {
 		select {
@@ -51,6 +64,11 @@ func (handler serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequ
 			switch request.Cmd {
 			case svc.Interrogate:
 				statuses <- status
+			case svc.SessionChange:
+				select {
+				case notifications <- struct{}{}:
+				default:
+				}
 			case svc.Stop, svc.Shutdown:
 				return handler.stop(cancel, runDone, statuses)
 			}

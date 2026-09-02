@@ -160,6 +160,50 @@ func TestRuntimeResynchronizesAfterSubscriptionRegistration(t *testing.T) {
 	}
 }
 
+func TestRuntimeReportsReadyAfterInitialization(t *testing.T) {
+	source := newFakeSource("en")
+	device := newFakeDevice()
+	ready := make(chan struct{})
+	runtime := Runtime{
+		Layouts: source, Config: configuredRepository(), Devices: fakeOpener{device: device},
+		Ready: func() error {
+			close(ready)
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	assertColor(t, device.applied, color.RGB{R: 1, G: 2, B: 3})
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not report readiness")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !device.isClosed() || !source.subscription.isClosed() {
+		t.Fatal("runtime did not clean up after readiness")
+	}
+}
+
+func TestRuntimeReadinessFailureCleansUp(t *testing.T) {
+	source := newFakeSource("en")
+	device := newFakeDevice()
+	runtime := Runtime{
+		Layouts: source, Config: configuredRepository(), Devices: fakeOpener{device: device},
+		Ready: func() error { return errors.New("pipe closed") },
+	}
+	if err := runtime.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "report runtime readiness") {
+		t.Fatalf("runtime error = %v, want readiness failure", err)
+	}
+	if !device.isClosed() || !source.subscription.isClosed() {
+		t.Fatal("runtime did not clean up after readiness failure")
+	}
+}
+
 func TestRuntimeCreatesAndReconcilesConfigOnce(t *testing.T) {
 	source := newFakeSource("en")
 	repository := &fakeRepository{value: config.New()}

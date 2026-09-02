@@ -16,7 +16,7 @@ func TestServiceHandlerCancelsAndWaitsForRuntime(t *testing.T) {
 			started := make(chan struct{})
 			canceled := make(chan struct{})
 			release := make(chan struct{})
-			handler := serviceHandler{run: func(ctx context.Context) error {
+			handler := serviceHandler{run: func(ctx context.Context, _ <-chan struct{}) error {
 				close(started)
 				<-ctx.Done()
 				close(canceled)
@@ -59,7 +59,7 @@ func TestServiceHandlerCancelsAndWaitsForRuntime(t *testing.T) {
 }
 
 func TestServiceHandlerReportsRuntimeFailure(t *testing.T) {
-	handler := serviceHandler{run: func(context.Context) error {
+	handler := serviceHandler{run: func(context.Context, <-chan struct{}) error {
 		return context.DeadlineExceeded
 	}}
 	statuses := make(chan svc.Status, 2)
@@ -69,6 +69,48 @@ func TestServiceHandlerReportsRuntimeFailure(t *testing.T) {
 	}
 	assertServiceStatus(t, statuses, svc.StartPending)
 	assertServiceStatus(t, statuses, svc.Running)
+}
+
+func TestServiceHandlerAcceptsAndForwardsSessionChanges(t *testing.T) {
+	reconciled := make(chan struct{}, 1)
+	handler := serviceHandler{run: func(ctx context.Context, notifications <-chan struct{}) error {
+		select {
+		case <-notifications:
+			reconciled <- struct{}{}
+		case <-ctx.Done():
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	requests := make(chan svc.ChangeRequest, 2)
+	statuses := make(chan svc.Status, 3)
+	result := make(chan serviceResult, 1)
+	go func() {
+		specific, code := handler.Execute(nil, requests, statuses)
+		result <- serviceResult{specific: specific, code: code}
+	}()
+
+	assertServiceStatus(t, statuses, svc.StartPending)
+	running := <-statuses
+	if running.State != svc.Running || running.Accepts&svc.AcceptSessionChange == 0 {
+		t.Fatalf("running status = %+v, want session-change acceptance", running)
+	}
+	requests <- svc.ChangeRequest{Cmd: svc.SessionChange}
+	select {
+	case <-reconciled:
+	case <-time.After(time.Second):
+		t.Fatal("session change was not forwarded to the runtime")
+	}
+	requests <- svc.ChangeRequest{Cmd: svc.Stop}
+	assertServiceStatus(t, statuses, svc.StopPending)
+	select {
+	case got := <-result:
+		if got != (serviceResult{}) {
+			t.Fatalf("Execute result = %+v, want clean service exit", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute did not return after Stop")
+	}
 }
 
 func TestRunWithoutArgumentsIsReservedForUI(t *testing.T) {

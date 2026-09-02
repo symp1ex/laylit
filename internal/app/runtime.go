@@ -21,6 +21,7 @@ type Runtime struct {
 	Devices      DeviceOpener
 	ReportError  func(error)
 	Tracef       func(string, ...any)
+	Ready        func() error
 	DefaultColor color.RGB
 }
 
@@ -85,6 +86,11 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 			return fmt.Errorf("apply active layout after subscription %q: %w", resynchronized.ID, err)
 		}
 		appliedLayoutID = resynchronized.ID
+	}
+	if runtime.Ready != nil {
+		if err := runtime.Ready(); err != nil {
+			return fmt.Errorf("report runtime readiness: %w", err)
+		}
 	}
 
 	events := subscription.Events()

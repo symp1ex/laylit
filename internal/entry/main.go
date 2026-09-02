@@ -25,12 +25,20 @@ import (
 
 const serviceName = "Laylit"
 
+const sessionHelperArgument = "--session-helper"
+
 func Main(args []string, attachForCommands bool) int {
 	if isServiceMode(args) {
 		if err := runService(); err != nil {
 			_, stderr, closeOutputs := winconsole.Outputs(attachForCommands)
 			defer closeOutputs()
 			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		return 0
+	}
+	if isSessionHelperMode(args) {
+		if err := runSessionHelper(args[1], args[2]); err != nil {
 			return 1
 		}
 		return 0
@@ -138,7 +146,15 @@ func isServiceMode(args []string) bool {
 	return len(args) == 1 && args[0] == "-service"
 }
 
+func isSessionHelperMode(args []string) bool {
+	return len(args) == 3 && args[0] == sessionHelperArgument
+}
+
 func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) error {
+	return runAutomaticWithReady(ctx, debug, fallbackWriter, nil)
+}
+
+func runAutomaticWithReady(ctx context.Context, debug bool, fallbackWriter io.Writer, ready func() error) error {
 	configPath, err := applicationConfigPath()
 	if err != nil {
 		return err
@@ -168,6 +184,7 @@ func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) err
 		Layouts: windowslayouts.NewSourceWithDebug(debugf), Config: config.NewFileRepository(configPath), Devices: registry,
 		ReportError: func(err error) { logger.Printf("runtime warning: %v", err) },
 		Tracef:      debugf,
+		Ready:       ready,
 	}
 	if err := runtime.Run(ctx); err != nil {
 		logger.Printf("automatic mode stopped: %v", err)
