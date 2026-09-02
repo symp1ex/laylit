@@ -19,13 +19,27 @@ driver, Zadig, administrator privileges, cgo, or a HID DLL.
 
 Keep the standard Windows HID driver installed. Do not replace it with WinUSB.
 
-## Automatic mode
+## Launch modes
 
-Run without a positional command:
+Running without arguments is reserved for the future UI and currently exits
+without starting the application runtime:
 
 ```powershell
 .\laylit.exe
 ```
+
+SCM starts the long-running runtime explicitly with:
+
+```powershell
+.\Laylit.exe -service
+```
+
+`-service` is the only way service mode is selected; there is no automatic
+SCM detection or error-driven fallback. For compatibility, the existing
+`--debug` argument without a positional command still runs the automatic mode
+directly and mirrors diagnostics to a console when one is available.
+
+## Automatic runtime
 
 At startup the application:
 
@@ -48,9 +62,8 @@ Alt/Shift modifier chord, never suppresses input, and does not infer a layout
 from the keys: the listener always reads and deduplicates the foreground
 thread's actual HKL.
 
-The production `laylit.exe` is linked with the Windows GUI subsystem, so
-the no-argument mode does not create a console window. There is no tray icon or
-other UI.
+The production `Laylit.exe` is linked with the Windows GUI subsystem. There is
+currently no tray icon or other UI.
 
 ## Configuration
 
@@ -135,6 +148,24 @@ go build -o laylit-console.exe ./cmd/laylit-console
 The split is an entry-point/linker concern only. Console visibility and
 diagnostic streams are not part of the application orchestration.
 
+## Windows service installation
+
+Build `Laylit.exe`, keep it next to `install-service.bat`, and run an elevated
+Command Prompt or PowerShell in that directory. The editable service settings
+(`SERVICE_NAME`, display name, description, executable path, and start type)
+are grouped at the top of the script. `SERVICE_NAME` must remain equal to the
+Go runtime service name, `Laylit`.
+
+```powershell
+.\install-service.bat install
+.\install-service.bat start
+.\install-service.bat stop
+.\install-service.bat uninstall
+```
+
+The registered `binPath` is equivalent to `"C:\path\to\Laylit.exe" -service`,
+including correct quoting when the path contains spaces.
+
 ## Architecture
 
 ```text
@@ -204,20 +235,25 @@ go build ./cmd/laylit-console
 Tests cover HEX parsing, config creation/merge/validation/idempotence, fake-only
 application orchestration and cleanup, Windows HKL normalization, VID/PID and
 collection selection, report-size guards, exact static/off reports, checksum
-overflow, RGB order, write/ack semantics, and I/O deadlines.
+overflow, RGB order, write/ack semantics, I/O deadlines, and Windows service
+Stop/Shutdown cancellation and wait behavior.
 
 ## Limitations
 
 - `320F:5000` is reused by several OEM keyboards. Strict collection and report
   checks reduce risk, but each firmware revision still needs a physical test.
 - `RegisterShellHookWindow` is a desktop Shell API. The listener must run in an
-  interactive Windows desktop session, not Session 0 or a service. Windows does
-  not document a layout-specific registered Shell notification, so the listener
-  resynchronizes on every delivered Shell event and never interprets its
-  `wParam` or `lParam` as an HKL. Alt+Shift is covered by a global
-  `WH_KEYBOARD_LL` modifier hook on that desktop because it can change the
-  foreground HKL without delivering a Shell event. Cross-version Windows 10/11
-  delivery still requires integration testing.
+  interactive Windows desktop session. A Windows service runs in Session 0, so
+  the current layout source cannot observe the signed-in user's foreground HKL
+  there and may fail during startup. The SCM lifecycle and graceful shutdown
+  wiring are complete, but useful service-mode layout tracking requires a
+  future per-user helper plus IPC (or another user-session-aware source).
+  Windows does not document a layout-specific registered Shell notification,
+  so the interactive listener resynchronizes on every delivered Shell event
+  and never interprets its `wParam` or `lParam` as an HKL. Alt+Shift is covered
+  by a global `WH_KEYBOARD_LL` modifier hook on that desktop because it can
+  change the foreground HKL without delivering a Shell event. Cross-version
+  Windows 10/11 delivery still requires integration testing.
 - Windows documents that some modern IME/TSF profiles can use transient input
   locale identifiers and may not emit classic `WM_INPUTLANGCHANGE`. Classic
   keyboard layouts such as EN/RU use stable HKL identifiers; unusual IME/TSF

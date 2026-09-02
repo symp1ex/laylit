@@ -23,12 +23,39 @@ import (
 	"laylit/internal/winconsole"
 )
 
+const serviceName = "Laylit"
+
 func Main(args []string, attachForCommands bool) int {
+	if isServiceMode(args) {
+		if err := runService(); err != nil {
+			_, stderr, closeOutputs := winconsole.Outputs(attachForCommands)
+			defer closeOutputs()
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		return 0
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if len(args) == 0 {
+		return 0
+	}
+
 	stdout, stderr, closeOutputs := winconsole.Outputs(attachForCommands && len(args) > 0)
 	defer closeOutputs()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(interrupts)
+	go func() {
+		select {
+		case <-interrupts:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	if err := Run(ctx, args, stdout, stderr); err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
@@ -37,12 +64,17 @@ func Main(args []string, attachForCommands bool) int {
 }
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return nil
+	}
+
 	flags := flag.NewFlagSet("laylit", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	debug := flags.Bool("debug", false, "show HID discovery, layout, and report diagnostics")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  laylit [--debug]")
+		fmt.Fprintln(stderr, "  laylit -service")
+		fmt.Fprintln(stderr, "  laylit --debug")
 		fmt.Fprintln(stderr, "  laylit [--debug] info")
 		fmt.Fprintln(stderr, "  laylit [--debug] set <RRGGBB|#RRGGBB>")
 		fmt.Fprintln(stderr, "  laylit [--debug] off")
@@ -100,6 +132,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		flags.Usage()
 		return fmt.Errorf("unknown command %q", commandArgs[0])
 	}
+}
+
+func isServiceMode(args []string) bool {
+	return len(args) == 1 && args[0] == "-service"
 }
 
 func runAutomatic(ctx context.Context, debug bool, fallbackWriter io.Writer) error {
