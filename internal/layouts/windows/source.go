@@ -37,6 +37,7 @@ var (
 	procDispatchMessageW          = user32.NewProc("DispatchMessageW")
 	procPostMessageW              = user32.NewProc("PostMessageW")
 	procPostQuitMessage           = user32.NewProc("PostQuitMessage")
+	procGetGUIThreadInfo          = user32.NewProc("GetGUIThreadInfo")
 	procRegisterWindowMessageW    = user32.NewProc("RegisterWindowMessageW")
 	procRegisterShellHookWindow   = user32.NewProc("RegisterShellHookWindow")
 	procDeregisterShellHookWindow = user32.NewProc("DeregisterShellHookWindow")
@@ -50,13 +51,18 @@ var (
 )
 
 type Source struct {
-	debugf func(string, ...any)
+	debugf   func(string, ...any)
+	resolver *layoutResolver
 }
 
-func NewSource() *Source { return &Source{} }
+func NewSource() *Source { return newSource(nil) }
 
 func NewSourceWithDebug(debugf func(string, ...any)) *Source {
-	return &Source{debugf: debugf}
+	return newSource(debugf)
+}
+
+func newSource(debugf func(string, ...any)) *Source {
+	return &Source{debugf: debugf, resolver: newLayoutResolver(readWindowsInputContext)}
 }
 
 func (source *Source) List(ctx context.Context) ([]layouts.Layout, error) {
@@ -90,27 +96,16 @@ func (source *Source) List(ctx context.Context) ([]layouts.Layout, error) {
 	return result, nil
 }
 
-// Current deliberately queries the foreground window's owning thread. Calling
-// GetKeyboardLayout(0) here would return the background listener's own layout.
 func (source *Source) Current(ctx context.Context) (layouts.Layout, error) {
 	if err := ctx.Err(); err != nil {
 		return layouts.Layout{}, err
 	}
-	hwnd := windows.GetForegroundWindow()
-	if hwnd == 0 {
-		return layouts.Layout{}, errors.New("cannot determine active layout: no foreground window")
+	resolved, err := source.resolver.resolve()
+	if err != nil {
+		return layouts.Layout{}, err
 	}
-	threadID, err := windows.GetWindowThreadProcessId(hwnd, nil)
-	if threadID == 0 {
-		return layouts.Layout{}, fmt.Errorf("cannot determine foreground window thread: %w", err)
-	}
-	hkl := windows.GetKeyboardLayout(threadID)
-	if hkl == 0 {
-		return layouts.Layout{}, errors.New("GetKeyboardLayout returned an empty input locale identifier")
-	}
-	layout := describeHKL(uintptr(hkl))
-	source.debug("current foreground_hwnd=0x%X foreground_tid=%d foreground_hkl=0x%X layout_id=%s", uintptr(hwnd), threadID, uintptr(hkl), layout.ID)
-	return layout, nil
+	source.debug("%s", formatResolvedLayout(resolved))
+	return resolved.layout, nil
 }
 
 func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, error) {
@@ -118,7 +113,7 @@ func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, erro
 		return nil, err
 	}
 	subscription := &subscription{
-		current: source.Current, debugf: source.debugf, events: make(chan layouts.Layout, 1), errors: make(chan error, 1),
+		current: source.Current, resolver: source.resolver, debugf: source.debugf, events: make(chan layouts.Layout, 1), errors: make(chan error, 1),
 		done: make(chan struct{}),
 	}
 	ready := make(chan error, 1)
@@ -137,17 +132,21 @@ func (source *Source) Subscribe(ctx context.Context) (layouts.Subscription, erro
 }
 
 type subscription struct {
-	current   func(context.Context) (layouts.Layout, error)
-	debugf    func(string, ...any)
-	events    chan layouts.Layout
-	errors    chan error
-	done      chan struct{}
-	hwnd      uintptr
-	closeOnce sync.Once
-	mu        sync.Mutex
-	loopErr   error
-	lastID    string
-	keyboard  keyboardChordState
+	current     func(context.Context) (layouts.Layout, error)
+	resolver    *layoutResolver
+	debugf      func(string, ...any)
+	events      chan layouts.Layout
+	errors      chan error
+	done        chan struct{}
+	hwnd        uintptr
+	closeOnce   sync.Once
+	mu          sync.Mutex
+	lifecycleMu sync.Mutex
+	publishMu   sync.Mutex
+	loopErr     error
+	lastID      string
+	keyboard    keyboardChordState
+	stopped     atomic.Bool
 }
 
 func (subscription *subscription) Events() <-chan layouts.Layout { return subscription.events }
@@ -213,8 +212,15 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 		return
 	}
 	defer procDeregisterShellHookWindow.Call(hwnd)
+	tsf, tsfErr := startTSFListener(subscription.onTSFProfile)
+	if tsfErr != nil {
+		replaceError(subscription.errors, fmt.Errorf("initialize TSF layout notifications: %w", tsfErr))
+	}
 	keyboardHook, err := installKeyboardHook(subscription)
 	if err != nil {
+		if tsf != nil {
+			_ = tsf.close()
+		}
 		procDestroyWindow.Call(hwnd)
 		ready <- err
 		close(subscription.done)
@@ -222,7 +228,7 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 	}
 
 	windowSubscriptions.Store(hwnd, windowState{subscription: subscription, shellMessage: uint32(shellMessage)})
-	subscription.debug("listener registered hwnd=0x%X shell_message=0x%X keyboard_hook=0x%X listener_tid=%d", hwnd, uint32(shellMessage), keyboardHook, windows.GetCurrentThreadId())
+	subscription.debug("listener registered hwnd=0x%X shell_message=0x%X keyboard_hook=0x%X tsf=%t listener_tid=%d", hwnd, uint32(shellMessage), keyboardHook, tsf != nil, windows.GetCurrentThreadId())
 	ready <- nil
 
 	var message msg
@@ -238,9 +244,16 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&message)))
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&message)))
 	}
+	subscription.stopPublishing()
 	if err := uninstallKeyboardHook(subscription, keyboardHook); err != nil {
 		subscription.setLoopError(err)
 		replaceError(subscription.errors, err)
+	}
+	if tsf != nil {
+		if err := tsf.close(); err != nil {
+			subscription.setLoopError(err)
+			replaceError(subscription.errors, err)
+		}
 	}
 	close(subscription.events)
 	close(subscription.errors)
@@ -248,10 +261,22 @@ func (subscription *subscription) messageLoop(ready chan<- error) {
 }
 
 func (subscription *subscription) publishCurrent() {
+	if subscription.stopped.Load() {
+		return
+	}
 	current, err := subscription.current(context.Background())
 	if err != nil {
 		subscription.debug("publish result=error error=%q", err)
 		replaceError(subscription.errors, fmt.Errorf("read active layout after Windows notification: %w", err))
+		return
+	}
+	subscription.publish(current)
+}
+
+func (subscription *subscription) publish(current layouts.Layout) {
+	subscription.publishMu.Lock()
+	defer subscription.publishMu.Unlock()
+	if subscription.stopped.Load() {
 		return
 	}
 	if current.ID == subscription.lastID {
@@ -261,6 +286,41 @@ func (subscription *subscription) publishCurrent() {
 	subscription.lastID = current.ID
 	replaceLayout(subscription.events, current)
 	subscription.debug("publish layout_id=%s result=published", current.ID)
+}
+
+func (subscription *subscription) onTSFProfile(profileType, flags uint32, hkl uintptr) {
+	subscription.lifecycleMu.Lock()
+	defer subscription.lifecycleMu.Unlock()
+	if subscription.stopped.Load() || subscription.resolver == nil {
+		return
+	}
+	resolved, accepted := subscription.resolver.activateTSF(profileType, flags, hkl)
+	if !accepted {
+		subscription.debug("tsf profile_type=%d flags=0x%X hkl=0x%X result=ignored", profileType, flags, hkl)
+		return
+	}
+	subscription.debug("tsf profile_type=%d flags=0x%X hkl=0x%X %s", profileType, flags, hkl, formatResolvedLayout(resolved))
+	subscription.publish(resolved.layout)
+}
+
+func (subscription *subscription) stopPublishing() {
+	subscription.stopped.Store(true)
+	subscription.lifecycleMu.Lock()
+	if subscription.resolver != nil {
+		subscription.resolver.clearTSF()
+	}
+	subscription.lifecycleMu.Unlock()
+	// Wait for an event publish that passed its initial stopped check.
+	subscription.publishMu.Lock()
+	subscription.publishMu.Unlock()
+}
+
+func (subscription *subscription) handleLayoutNotification(message, shellMessage uint32) bool {
+	if !isLayoutResynchronizationMessage(message, shellMessage) {
+		return false
+	}
+	subscription.publishCurrent()
+	return true
 }
 
 func (subscription *subscription) debug(format string, args ...any) {
@@ -287,7 +347,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		state, stateOK := value.(windowState)
 		if stateOK && isLayoutResynchronizationMessage(message, state.shellMessage) {
 			state.subscription.debug("notification wndproc=true message=0x%X shell_message=0x%X wparam=0x%X lparam=0x%X", message, state.shellMessage, wParam, lParam)
-			state.subscription.publishCurrent()
+			state.subscription.handleLayoutNotification(message, state.shellMessage)
 			if message == wmInputLangChange {
 				return 1
 			}
@@ -308,8 +368,8 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 // RegisterShellHookWindow does not document a layout-specific notification on
 // current Windows versions. Any delivered Shell event is therefore used only
 // as an event-driven resynchronization signal: its payload is never treated as
-// an HKL, and Current reads the foreground thread's actual layout. lastID keeps
-// unrelated Shell traffic from becoming duplicate layout events.
+// an HKL, and the resolver reads the strongest available layout state. lastID
+// keeps unrelated Shell traffic from becoming duplicate layout events.
 func isLayoutResynchronizationMessage(message, shellMessage uint32) bool {
 	return message == shellMessage || message == wmInputLangChange || message == wmKeyboardChordCompleted
 }
