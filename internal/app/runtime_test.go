@@ -104,44 +104,27 @@ func TestRuntimeSetColorEventErrorIsNonFatal(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("SetColor error was not reported")
 	}
-	source.subscription.events <- layouts.Layout{ID: "ru"}
-	assertColor(t, device.applied, color.RGB{R: 4, G: 5, B: 6})
+	select {
+	case got := <-device.applied:
+		if want := (color.RGB{R: 4, G: 5, B: 6}); got != want {
+			t.Fatalf("retried color = %v, want %v", got, want)
+		}
+	case <-time.After(2 * deviceRetryDelay):
+		t.Fatal("failed write was not retried")
+	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestRuntimeStartupFailuresCloseAcquiredDevice(t *testing.T) {
-	t.Run("device not found", func(t *testing.T) {
-		runtime := Runtime{Layouts: newFakeSource("en"), Config: configuredRepository(), Devices: fakeOpener{err: devices.ErrNotFound}}
-		if err := runtime.Run(context.Background()); !errors.Is(err, devices.ErrNotFound) {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("initial color failure", func(t *testing.T) {
-		device := newFakeDevice()
-		device.failOnCall = 1
-		runtime := Runtime{Layouts: newFakeSource("en"), Config: configuredRepository(), Devices: fakeOpener{device: device}}
-		if err := runtime.Run(context.Background()); err == nil {
-			t.Fatal("initial SetColor failure ignored")
-		}
-		if !device.isClosed() {
-			t.Fatal("device not closed after initial SetColor failure")
-		}
-	})
-	t.Run("subscribe failure", func(t *testing.T) {
-		source := newFakeSource("en")
-		source.subscribeErr = errors.New("listener failed")
-		device := newFakeDevice()
-		runtime := Runtime{Layouts: source, Config: configuredRepository(), Devices: fakeOpener{device: device}}
-		if err := runtime.Run(context.Background()); err == nil {
-			t.Fatal("subscribe failure ignored")
-		}
-		if !device.isClosed() {
-			t.Fatal("device not closed after subscribe failure")
-		}
-	})
+func TestRuntimeLayoutSubscribeFailure(t *testing.T) {
+	source := newFakeSource("en")
+	source.subscribeErr = errors.New("listener failed")
+	runtime := Runtime{Layouts: source, Config: configuredRepository(), Devices: &fakeDiscovery{}}
+	if err := runtime.Run(context.Background()); !errors.Is(err, source.subscribeErr) {
+		t.Fatalf("runtime error = %v", err)
+	}
 }
 
 func TestRuntimeResynchronizesAfterSubscriptionRegistration(t *testing.T) {
@@ -152,8 +135,8 @@ func TestRuntimeResynchronizesAfterSubscriptionRegistration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runtime.Run(ctx) }()
-	assertColor(t, device.applied, color.RGB{R: 1, G: 2, B: 3})
 	assertColor(t, device.applied, color.RGB{R: 4, G: 5, B: 6})
+	assertNoColor(t, device.applied)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -199,8 +182,8 @@ func TestRuntimeReadinessFailureCleansUp(t *testing.T) {
 	if err := runtime.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "report runtime readiness") {
 		t.Fatalf("runtime error = %v, want readiness failure", err)
 	}
-	if !device.isClosed() || !source.subscription.isClosed() {
-		t.Fatal("runtime did not clean up after readiness failure")
+	if !source.subscription.isClosed() {
+		t.Fatal("runtime did not close layout subscription after readiness failure")
 	}
 }
 
@@ -227,6 +210,7 @@ func TestRuntimeDoesNotRewriteUnchangedConfig(t *testing.T) {
 	source.list[0].Name = "English"
 	source.current.Name = "English"
 	repository := configuredRepository()
+	repository.value.AddDevice("keyboard")
 	device := newFakeDevice()
 	runtime := Runtime{Layouts: source, Config: repository, Devices: fakeOpener{device: device}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -243,10 +227,10 @@ func TestRuntimeDoesNotRewriteUnchangedConfig(t *testing.T) {
 }
 
 func configuredRepository() *fakeRepository {
-	return &fakeRepository{value: config.Config{Version: 1, Layouts: map[string]config.LayoutSettings{
-		"en": {Name: "English", Color: "#010203"},
-		"ru": {Name: "Russian", Color: "#040506"},
-	}}, exists: true}
+	value := config.New()
+	value.Layouts["en"] = config.LayoutSettings{Name: "English", Color: "#010203"}
+	value.Layouts["ru"] = config.LayoutSettings{Name: "Russian", Color: "#040506"}
+	return &fakeRepository{value: value, exists: true}
 }
 
 type fakeRepository struct {
@@ -317,11 +301,16 @@ func (subscription *fakeSubscription) isClosed() bool {
 
 type fakeOpener struct {
 	device devices.RGBDevice
-	err    error
 }
 
-func (opener fakeOpener) Open(context.Context) (devices.RGBDevice, error) {
-	return opener.device, opener.err
+func (opener fakeOpener) Discover(context.Context) (devices.Discovery, error) {
+	return devices.Discovery{Devices: []devices.Instance{fakeInstance("keyboard", opener.device)}}, nil
+}
+
+func fakeInstance(id string, device devices.RGBDevice) devices.Instance {
+	return devices.Instance{ID: id, Open: func(context.Context) (devices.RGBDevice, error) {
+		return device, nil
+	}}
 }
 
 type fakeDevice struct {

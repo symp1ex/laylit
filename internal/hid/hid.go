@@ -17,6 +17,10 @@ type Info struct {
 	InputReportLength   uint16
 	OutputReportLength  uint16
 	FeatureReportLength uint16
+	USBInstanceID       string
+	USBSerial           string
+	ContainerID         string
+	DiscoveryError      error
 }
 
 // Connection is an opened HID collection. Implementations must honor context

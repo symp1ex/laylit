@@ -1,21 +1,22 @@
 # Laylit
 
 Laylit is a Windows utility that shows the active keyboard input layout through
-a static keyboard-backlight color. Its device-provider architecture is intended
-to support additional keyboard families; the current provider supports an
-EVision/Redragon-compatible USB HID keyboard. Version 2 adds an event-driven
-automatic mode while preserving the original `info`, `set`, and `off`
-diagnostics.
+static keyboard-backlight colors. It supports the built-in ASUS TUF Gaming F17
+FX707ZC4 keyboard and EVision/Redragon-compatible USB keyboards, including
+simultaneous control of multiple keyboards.
 
 The current EVision driver supports VID `320F`, PID `5000`. It talks directly
 to the vendor HID collection and does not require OpenRGB at runtime, a WinUSB
 driver, Zadig, administrator privileges, cgo, or a HID DLL.
+The ASUS provider uses the installed Windows ATKACPI driver directly and
+applies colors without saving them to firmware.
 
 ## Requirements
 
 - Windows 10/11 x64
 - Go 1.26 for building
-- An EVision-compatible `320F:5000` keyboard
+- An ASUS TUF Gaming F17 FX707ZC4 or an EVision-compatible `320F:5000` keyboard
+  for lighting control
 
 Keep the standard Windows HID driver installed. Do not replace it with WinUSB.
 
@@ -46,21 +47,16 @@ At startup the application:
 1. reads the installed Windows input layouts and the foreground window's
    active layout;
 2. creates or reconciles `config.json`;
-3. opens the registered supported RGB device;
-4. immediately applies the active layout's color;
-5. treats delivered Windows Shell notifications as event-driven signals to
-   resynchronize the foreground thread's actual layout;
-6. uses a low-level modifier hook to request the same resynchronization after
-   Alt+Shift, which does not reliably produce a Shell notification;
-7. serially applies the newest notified layout color until the process exits.
+3. subscribes to Windows layout and device notifications;
+4. discovers supported keyboards and applies the active layout's color to
+   each enabled device.
 
-There is no timer or layout polling loop. Device writes are serialized. If
-several events arrive while HID I/O is in progress, the event adapter keeps the
-newest pending layout. A runtime `SetColor` failure is logged and the listener
-continues; startup failures are fatal. The Alt+Shift hook observes only the
-Alt/Shift modifier chord, never suppresses input, and does not infer a layout
-from the keys: the listener always reads and deduplicates the foreground
-thread's actual HKL.
+The layout listener reads and deduplicates the foreground thread's HKL.
+The Alt+Shift hook requests the same read when Windows does not send a Shell
+notification and leaves input delivery intact. Each enabled keyboard writes
+in sequence and keeps only the latest pending color. A failed connection is
+retried independently. The listener can run with zero keyboards and applies
+the current layout's color as supported keyboards connect.
 
 The production `Laylit.exe` is linked with the Windows GUI subsystem. There is
 currently no tray icon or other UI.
@@ -77,7 +73,7 @@ Example:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "layouts": {
     "HKL-04090409": {
       "name": "English (United States)",
@@ -86,6 +82,14 @@ Example:
     "HKL-04190419": {
       "name": "Russian (Russia)",
       "color": "#FF0000"
+    }
+  },
+  "devices": {
+    "asus-tuf:fx707zc4:internal": {
+      "enabled": true,
+      "colors": {
+        "HKL-04190419": "#33AAFF"
+      }
     }
   }
 }
@@ -96,6 +100,13 @@ localized display name. The name is metadata for people and may be refreshed;
 the identifier is the mapping key. Newly discovered layouts receive
 `#FFFFFF`. Existing colors are preserved, and entries for temporarily absent
 layouts are never deleted automatically.
+
+Laylit migrates version 1 on automatic startup and preserves the shared
+`layouts` palette. Use the device IDs printed by `info` as keys in `devices`.
+The color for an enabled keyboard comes from its `colors` override, the shared
+palette, or white, in that order. New keyboards are enabled by default.
+Set `enabled` to `false` to leave that keyboard's lighting as it is in
+automatic mode. Settings are kept while a keyboard is disconnected.
 
 Colors are case-insensitive and must be exactly `RRGGBB` or `#RRGGBB`. An
 invalid JSON document or invalid configured color stops startup with a clear
@@ -122,11 +133,19 @@ The original commands remain available:
 .\laylit.exe set "#FF0000"
 .\laylit.exe set "00FF7F"
 .\laylit.exe off
+.\laylit.exe set --device asus-tuf:fx707zc4:internal "#FF0000"
+.\laylit.exe off --device asus-tuf:fx707zc4:internal
 
 .\laylit.exe --debug info
 .\laylit.exe --debug set "#FF0000"
 .\laylit.exe --debug off
 ```
+
+When more than one supported keyboard is present, `set` and `off` require
+`--device <id>`. Run `info` to list the available IDs.
+USB IDs include VID/PID and a unique USB serial when available. The Windows
+ContainerId distinguishes keyboards with no unique serial. If Windows exposes
+colliding identities and cannot distinguish the keyboards, Laylit skips them.
 
 A GUI-subsystem build attaches to its parent console for explicit commands.
 For the most predictable development/debug terminal workflow, build and use
@@ -203,9 +222,8 @@ explicit in the composition root; there is no reflection or plugin framework.
 ## EVision protocol compatibility
 
 For `320F:5000`, the driver selects USB interface `1` and Usage Page `FF1C`.
-It deliberately does not constrain Usage ID. It refuses to send when zero or
-more than one collection matches and validates both input and output report
-sizes before use.
+It accepts any Usage ID. It requires just one matching collection per physical
+keyboard and checks both input and output report sizes before use.
 
 Static color remains exactly one 64-byte HID Output Report:
 
@@ -262,6 +280,4 @@ Stop/Shutdown cancellation and wait behavior.
   locale identifiers and may not emit classic `WM_INPUTLANGCHANGE`. Classic
   keyboard layouts such as EN/RU use stable HKL identifiers; unusual IME/TSF
   profiles require integration testing.
-- There is no device selector when multiple matching EVision RGB collections
-  exist; ambiguity is intentionally refused.
 - Only static hardware color and protocol-defined off are implemented.

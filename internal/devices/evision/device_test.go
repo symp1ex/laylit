@@ -54,11 +54,15 @@ func TestProviderUsesExactIDsAndClosesUnsupportedReportSizes(t *testing.T) {
 	for _, lengths := range []struct{ input, output int }{{reportSize, 65}, {65, reportSize}} {
 		connection := &fakeConnection{inputLength: lengths.input, outputLength: lengths.output}
 		transport := &fakeTransport{
-			infos:      []hid.Info{{Path: "candidate", Interface: rgbInterface, UsagePage: rgbUsagePage}},
+			infos:      []hid.Info{rgbCollection("candidate", "usb-node", "", "container")},
 			connection: connection,
 		}
 		provider := NewProvider(transport, Options{})
-		if _, err := provider.Open(context.Background()); err == nil {
+		inspection, err := provider.Discover(context.Background())
+		if err != nil || len(inspection.Devices) != 1 {
+			t.Fatalf("discover: devices=%v err=%v", inspection.Devices, err)
+		}
+		if _, err := inspection.Devices[0].Open(context.Background()); err == nil {
 			t.Fatal("unsupported report size accepted")
 		}
 		if transport.vendorID != vendorID || transport.productID != productID {
@@ -75,6 +79,7 @@ type fakeTransport struct {
 	connection hid.Connection
 	vendorID   uint16
 	productID  uint16
+	openedPath string
 }
 
 func (transport *fakeTransport) Enumerate(_ context.Context, vendorID, productID uint16) ([]hid.Info, error) {
@@ -82,7 +87,8 @@ func (transport *fakeTransport) Enumerate(_ context.Context, vendorID, productID
 	return transport.infos, nil
 }
 
-func (transport *fakeTransport) Open(context.Context, string) (hid.Connection, error) {
+func (transport *fakeTransport) Open(_ context.Context, path string) (hid.Connection, error) {
+	transport.openedPath = path
 	return transport.connection, nil
 }
 

@@ -5,13 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"laylit/internal/winio"
 )
 
 const hidpStatusSuccess = 0x00110000
@@ -76,6 +78,13 @@ type spDeviceInterfaceDetailDataW struct {
 	DevicePath [1]uint16
 }
 
+type spDevInfoData struct {
+	Size      uint32
+	ClassGUID windows.GUID
+	DevInst   uint32
+	Reserved  uintptr
+}
+
 type windowsConnection struct {
 	handle             windows.Handle
 	inputReportLength  int
@@ -88,7 +97,7 @@ func (transport *WindowsTransport) Enumerate(ctx context.Context, vendorID, prod
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return enumerateHID(vendorID, productID)
+	return enumerateHID(ctx, vendorID, productID)
 }
 
 func (transport *WindowsTransport) Open(ctx context.Context, path string) (Connection, error) {
@@ -98,7 +107,7 @@ func (transport *WindowsTransport) Open(ctx context.Context, path string) (Conne
 	return openHID(path)
 }
 
-func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
+func enumerateHID(ctx context.Context, wantVendorID, wantProductID uint16) ([]Info, error) {
 	guid := new(windows.GUID)
 	procHidDGetHidGuid.Call(uintptr(unsafe.Pointer(guid)))
 
@@ -115,6 +124,9 @@ func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 	pathNeedle := fmt.Sprintf("vid_%04x&pid_%04x", wantVendorID, wantProductID)
 	var infos []Info
 	for index := uint32(0); ; index++ {
+		if err := ctx.Err(); err != nil {
+			return infos, err
+		}
 		interfaceData := spDeviceInterfaceData{CbSize: uint32(unsafe.Sizeof(spDeviceInterfaceData{}))}
 		ok, _, err := procSetupDiEnumDeviceInterfaces.Call(
 			uintptr(deviceSet), 0, uintptr(unsafe.Pointer(guid)), uintptr(index),
@@ -124,28 +136,36 @@ func enumerateHID(wantVendorID, wantProductID uint16) ([]Info, error) {
 			if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
 				break
 			}
-			return nil, err
+			return infos, err
 		}
 
-		path, err := deviceInterfacePath(deviceSet, &interfaceData)
+		devInfo := spDevInfoData{}
+		path, err := deviceInterfacePath(deviceSet, &interfaceData, &devInfo)
 		if err != nil {
-			return nil, err
+			if errors.Is(err, windows.ERROR_NO_SUCH_DEVICE) || errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+				continue
+			}
+			return infos, err
 		}
 		if !strings.Contains(strings.ToLower(path), pathNeedle) {
 			continue
 		}
 		info, err := readHIDInfo(path)
 		if err != nil {
-			return nil, fmt.Errorf("read HID metadata for %q: %w", path, err)
+			info = Info{Path: path, VendorID: wantVendorID, ProductID: wantProductID, Interface: interfaceNumberFromPath(path)}
+			info.DiscoveryError = fmt.Errorf("read HID metadata for %q: %w", path, err)
 		}
 		if info.VendorID == wantVendorID && info.ProductID == wantProductID {
+			if err := readUSBIdentity(&info, uint32(devInfo.DevInst), pathNeedle); err != nil {
+				info.DiscoveryError = errors.Join(info.DiscoveryError, fmt.Errorf("identify USB keyboard for %q: %w", path, err))
+			}
 			infos = append(infos, info)
 		}
 	}
 	return infos, nil
 }
 
-func deviceInterfacePath(deviceSet windows.Handle, interfaceData *spDeviceInterfaceData) (string, error) {
+func deviceInterfacePath(deviceSet windows.Handle, interfaceData *spDeviceInterfaceData, devInfo *spDevInfoData) (string, error) {
 	var requiredSize uint32
 	ok, _, err := procSetupDiGetDeviceInterfaceDetailW.Call(
 		uintptr(deviceSet), uintptr(unsafe.Pointer(interfaceData)), 0, 0,
@@ -160,11 +180,15 @@ func deviceInterfacePath(deviceSet windows.Handle, interfaceData *spDeviceInterf
 
 	buffer := make([]byte, requiredSize)
 	detail := (*spDeviceInterfaceDetailDataW)(unsafe.Pointer(&buffer[0]))
-	detail.CbSize = uint32(unsafe.Sizeof(spDeviceInterfaceDetailDataW{}))
+	detail.CbSize = 8
+	if unsafe.Sizeof(uintptr(0)) == 4 {
+		detail.CbSize = 6
+	}
+	devInfo.Size = uint32(unsafe.Sizeof(*devInfo))
 	ok, _, err = procSetupDiGetDeviceInterfaceDetailW.Call(
 		uintptr(deviceSet), uintptr(unsafe.Pointer(interfaceData)),
 		uintptr(unsafe.Pointer(detail)), uintptr(requiredSize),
-		uintptr(unsafe.Pointer(&requiredSize)), 0,
+		uintptr(unsafe.Pointer(&requiredSize)), uintptr(unsafe.Pointer(devInfo)),
 	)
 	if ok == 0 {
 		return "", err
@@ -282,63 +306,11 @@ func (device *windowsConnection) Read(ctx context.Context, report []byte) (int, 
 type overlappedOperation func(windows.Handle, []byte, *uint32, *windows.Overlapped) error
 
 func (device *windowsConnection) overlappedIO(ctx context.Context, buffer []byte, operation overlappedOperation) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	event, err := windows.CreateEvent(nil, 1, 0, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer windows.Close(event)
-
-	overlapped := &windows.Overlapped{HEvent: event}
-	var transferred uint32
-	err = operation(device.handle, buffer, &transferred, overlapped)
-	if err == nil {
-		return int(transferred), nil
-	}
-	if !errors.Is(err, windows.ERROR_IO_PENDING) {
-		return 0, err
-	}
-	timeout, err := contextTimeout(ctx)
-	if err != nil {
-		_ = windows.CancelIoEx(device.handle, overlapped)
-		return 0, err
-	}
-	status, err := windows.WaitForSingleObject(event, timeout)
-	if err != nil {
-		_ = windows.CancelIoEx(device.handle, overlapped)
-		return 0, err
-	}
-	if status == uint32(windows.WAIT_TIMEOUT) {
-		_ = windows.CancelIoEx(device.handle, overlapped)
-		_ = windows.GetOverlappedResult(device.handle, overlapped, &transferred, true)
-		return 0, context.DeadlineExceeded
-	}
-	if status != windows.WAIT_OBJECT_0 {
-		_ = windows.CancelIoEx(device.handle, overlapped)
-		return 0, fmt.Errorf("unexpected overlapped I/O wait status: %d", status)
-	}
-	if err := windows.GetOverlappedResult(device.handle, overlapped, &transferred, false); err != nil {
-		return 0, err
-	}
-	return int(transferred), nil
-}
-
-func contextTimeout(ctx context.Context) (uint32, error) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return windows.INFINITE, nil
-	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return 0, context.DeadlineExceeded
-	}
-	milliseconds := (remaining + time.Millisecond - 1) / time.Millisecond
-	if milliseconds >= time.Duration(windows.INFINITE) {
-		return windows.INFINITE - 1, nil
-	}
-	return uint32(milliseconds), nil
+	transferred, err := winio.Overlapped(ctx, device.handle, func(n *uint32, overlapped *windows.Overlapped) error {
+		return operation(device.handle, buffer, n, overlapped)
+	})
+	runtime.KeepAlive(buffer)
+	return int(transferred), err
 }
 
 func (device *windowsConnection) Close() error {

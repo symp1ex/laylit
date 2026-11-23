@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"laylit/internal/color"
 	"laylit/internal/layouts"
 )
 
@@ -23,6 +24,62 @@ func TestReconcileCreatesDefaultsForAllLayouts(t *testing.T) {
 	for _, id := range []string{"en", "ru"} {
 		if got.Layouts[id].Color != DefaultColor {
 			t.Fatalf("layout %q color = %q", id, got.Layouts[id].Color)
+		}
+	}
+}
+
+func TestV1MigrationPreservesPaletteAndDeviceSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	err := os.WriteFile(path, []byte(`{"version":1,"layouts":{"en":{"name":"English","color":"abcdef"},"old":{"name":"Absent","color":"#112233"}}}`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	repo := NewFileRepository(path)
+	legacy, exists, err := repo.Load(ctx)
+	if err != nil || !exists {
+		t.Fatalf("load v1: exists=%t err=%v", exists, err)
+	}
+	current, changed, err := Reconcile(legacy, []layouts.Layout{{ID: "en", Name: "English"}})
+	if err != nil || !changed || current.Version != 2 {
+		t.Fatalf("migrate v1: config=%#v changed=%t err=%v", current, changed, err)
+	}
+	current.Devices["disabled"] = DeviceSettings{Enabled: false, Colors: map[string]string{"en": "#010203"}}
+	current.Devices["absent"] = DeviceSettings{Enabled: true, Colors: map[string]string{"old": "#445566"}}
+	if current.AddDevice("disabled") || !current.AddDevice("new") {
+		t.Fatal("discovery overwrote an existing device or failed to add a new one")
+	}
+	if err := repo.Save(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := repo.Load(ctx)
+	if err != nil || !reflect.DeepEqual(got, current) || got.Devices["disabled"].Enabled || !got.Devices["new"].Enabled {
+		t.Fatalf("round trip: config=%#v err=%v", got, err)
+	}
+	if got.Layouts["en"].Color != "abcdef" || got.Layouts["old"].Color != "#112233" {
+		t.Fatal("migration changed legacy colors")
+	}
+}
+
+func TestDeviceColorPriority(t *testing.T) {
+	value := New()
+	value.Layouts["en"] = LayoutSettings{Color: "#112233"}
+	value.Layouts["ru"] = LayoutSettings{Color: "#445566"}
+	value.Devices["asus"] = DeviceSettings{Enabled: true, Colors: map[string]string{"en": "#000000", "other": "#070809"}}
+	white := color.RGB{R: 255, G: 255, B: 255}
+	for _, test := range []struct {
+		device, hkl, want string
+		known             bool
+	}{
+		{"asus", "en", "#000000", true},
+		{"asus", "ru", "#445566", true},
+		{"asus", "other", "#070809", true},
+		{"usb", "en", "#112233", true},
+		{"usb", "other", "#FFFFFF", false},
+	} {
+		got, known, err := value.DeviceColor(test.device, test.hkl, white)
+		if err != nil || known != test.known || got.String() != test.want {
+			t.Errorf("%s/%s: got %s known=%t err=%v, want %s known=%t", test.device, test.hkl, got, known, err, test.want, test.known)
 		}
 	}
 }
@@ -111,6 +168,8 @@ func TestFileRepositoryRejectsInvalidJSONAndColor(t *testing.T) {
 		{"invalid JSON", `{`},
 		{"trailing JSON", `{"version":1,"layouts":{}} {}`},
 		{"invalid color", `{"version":1,"layouts":{"en":{"name":"English","color":"white"}}}`},
+		{"invalid device color", `{"version":2,"devices":{"asus":{"enabled":false,"colors":{"en":"white"}}}}`},
+		{"invalid device enabled", `{"version":2,"devices":{"asus":{"enabled":"false"}}}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

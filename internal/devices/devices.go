@@ -37,17 +37,24 @@ type Inspection struct {
 	Description     string
 	NotFoundMessage string
 	Collections     []CollectionInfo
+	Devices         []Instance
+}
+
+// Instance identifies a detected keyboard and opens that particular connection.
+// Location changes when the underlying interface path changes.
+type Instance struct {
+	ID       string
+	Name     string
+	Location string
+	Open     func(context.Context) (RGBDevice, error)
 }
 
 // Provider owns detection and opening rules for one device family.
 type Provider interface {
 	Name() string
-	Open(ctx context.Context) (RGBDevice, error)
-	Inspect(ctx context.Context) (Inspection, error)
+	Discover(ctx context.Context) (Inspection, error)
 }
 
-// Registry tries providers in registration order. Adding a device family only
-// requires registering another provider in the composition root.
 type Registry struct {
 	providers []Provider
 }
@@ -56,28 +63,37 @@ func NewRegistry(providers ...Provider) *Registry {
 	return &Registry{providers: append([]Provider(nil), providers...)}
 }
 
-func (registry *Registry) Open(ctx context.Context) (RGBDevice, error) {
-	for _, provider := range registry.providers {
-		device, err := provider.Open(ctx)
-		if err == nil {
-			return device, nil
-		}
-		if errors.Is(err, ErrNotFound) {
-			continue
-		}
-		return nil, fmt.Errorf("open %s device: %w", provider.Name(), err)
-	}
-	return nil, ErrNotFound
+type Discovery struct {
+	Devices     []Instance
+	Inspections []Inspection
 }
 
-func (registry *Registry) Inspect(ctx context.Context) ([]Inspection, error) {
-	inspections := make([]Inspection, 0, len(registry.providers))
+// Discover returns usable devices even if another provider or instance fails.
+func (registry *Registry) Discover(ctx context.Context) (Discovery, error) {
+	var result Discovery
+	var errs []error
+	counts := make(map[string]int)
 	for _, provider := range registry.providers {
-		inspection, err := provider.Inspect(ctx)
+		inspection, err := provider.Discover(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("inspect %s devices: %w", provider.Name(), err)
+			errs = append(errs, fmt.Errorf("discover %s devices: %w", provider.Name(), err))
 		}
-		inspections = append(inspections, inspection)
+		result.Inspections = append(result.Inspections, inspection)
+		for _, device := range inspection.Devices {
+			counts[device.ID]++
+		}
 	}
-	return inspections, nil
+	for _, inspection := range result.Inspections {
+		for _, device := range inspection.Devices {
+			if counts[device.ID] != 1 {
+				if counts[device.ID] > 1 {
+					errs = append(errs, fmt.Errorf("ambiguous RGB device ID %q", device.ID))
+					counts[device.ID] = 0
+				}
+				continue
+			}
+			result.Devices = append(result.Devices, device)
+		}
+	}
+	return result, errors.Join(errs...)
 }

@@ -17,6 +17,7 @@ import (
 	"laylit/internal/color"
 	"laylit/internal/config"
 	"laylit/internal/devices"
+	"laylit/internal/devices/asustuf"
 	"laylit/internal/devices/evision"
 	"laylit/internal/hid"
 	windowslayouts "laylit/internal/layouts/windows"
@@ -80,66 +81,138 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("laylit", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	debug := flags.Bool("debug", false, "show HID discovery, layout, and report diagnostics")
+	deviceID := flags.String("device", "", "select an RGB device by ID")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
 		fmt.Fprintln(stderr, "  laylit -service")
 		fmt.Fprintln(stderr, "  laylit --debug")
 		fmt.Fprintln(stderr, "  laylit [--debug] info")
-		fmt.Fprintln(stderr, "  laylit [--debug] set <RRGGBB|#RRGGBB>")
-		fmt.Fprintln(stderr, "  laylit [--debug] off")
+		fmt.Fprintln(stderr, "  laylit [--debug] set [--device <id>] <RRGGBB|#RRGGBB>")
+		fmt.Fprintln(stderr, "  laylit [--debug] off [--device <id>]")
 	}
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	commandArgs := flags.Args()
 	if len(commandArgs) == 0 {
+		if *deviceID != "" {
+			return errors.New("--device requires set or off")
+		}
 		return runAutomatic(ctx, *debug, stderr)
 	}
 
-	transport := hid.NewWindowsTransport()
-	provider := evision.NewProvider(transport, evision.Options{Debug: *debug, DebugWriter: stderr})
-	registry := devices.NewRegistry(provider)
+	registry := newDeviceRegistry(*debug, stderr, nil)
+	if commandArgs[0] == "info" && len(commandArgs) == 1 && *deviceID == "" {
+		return printInfo(ctx, stdout, registry)
+	}
 	switch commandArgs[0] {
 	case "info":
-		if len(commandArgs) != 1 {
-			return errors.New("info does not accept arguments")
-		}
-		return printInfo(ctx, stdout, registry)
-	case "set":
-		if len(commandArgs) != 2 {
-			return errors.New("set requires one color argument")
-		}
-		value, err := color.Parse(commandArgs[1])
-		if err != nil {
-			return err
-		}
-		device, err := registry.Open(ctx)
-		if err != nil {
-			return err
-		}
-		defer device.Close()
-		if err := device.SetColor(ctx, value); err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "Color set to %s\n", value)
-		return nil
-	case "off":
-		if len(commandArgs) != 1 {
-			return errors.New("off does not accept arguments")
-		}
-		device, err := registry.Open(ctx)
-		if err != nil {
-			return err
-		}
-		defer device.Close()
-		if err := device.Off(ctx); err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, "Lighting off")
-		return nil
+		return errors.New("info does not accept arguments")
+	case "set", "off":
+		return runDeviceCommand(ctx, stdout, stderr, registry, *debug, *deviceID, commandArgs)
 	default:
 		flags.Usage()
 		return fmt.Errorf("unknown command %q", commandArgs[0])
+	}
+}
+
+func newDeviceRegistry(debug bool, debugWriter io.Writer, debugf func(string, ...any)) *devices.Registry {
+	if debug && debugf == nil {
+		debugf = func(format string, args ...any) {
+			fmt.Fprintf(debugWriter, "DEBUG "+format+"\n", args...)
+		}
+	}
+	return devices.NewRegistry(
+		evision.NewProvider(hid.NewWindowsTransport(), evision.Options{Debug: debug, DebugWriter: debugWriter}),
+		asustuf.NewProvider(debugf),
+	)
+}
+
+func runDeviceCommand(ctx context.Context, stdout, stderr io.Writer, registry *devices.Registry, debug bool, id string, args []string) (returnErr error) {
+	command := args[0]
+	var positional []string
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--device" || strings.HasPrefix(args[i], "--device=") {
+			selector := strings.TrimPrefix(args[i], "--device=")
+			if args[i] == "--device" {
+				i++
+				if i >= len(args) || strings.HasPrefix(args[i], "--") {
+					return errors.New("--device requires a device ID")
+				}
+				selector = args[i]
+			}
+			if selector == "" || id != "" {
+				return errors.New("--device requires exactly one device ID")
+			}
+			id = selector
+		} else {
+			positional = append(positional, args[i])
+		}
+	}
+	var value color.RGB
+	if command == "set" {
+		if len(positional) != 1 {
+			return errors.New("set requires one color argument")
+		}
+		var err error
+		value, err = color.Parse(positional[0])
+		if err != nil {
+			return err
+		}
+	} else if len(positional) != 0 {
+		return errors.New("off does not accept arguments")
+	}
+
+	discovery, discoveryErr := registry.Discover(ctx)
+	instance, err := selectDevice(discovery.Devices, id)
+	if err != nil {
+		return errors.Join(err, discoveryErr)
+	}
+	if discoveryErr != nil {
+		fmt.Fprintf(stderr, "warning: %v\n", discoveryErr)
+	}
+	if debug {
+		fmt.Fprintf(stderr, "DEBUG selected device_id=%s operation=%s\n", instance.ID, command)
+	}
+	device, err := instance.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("open RGB device %s: %w", instance.ID, err)
+	}
+	defer func() {
+		if err := device.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close RGB device %s: %w", instance.ID, err))
+		}
+	}()
+	if command == "set" {
+		if err := device.SetColor(ctx, value); err != nil {
+			return fmt.Errorf("set RGB device %s: %w", instance.ID, err)
+		}
+		fmt.Fprintf(stdout, "Color set to %s\n", value)
+	} else {
+		if err := device.Off(ctx); err != nil {
+			return fmt.Errorf("turn off RGB device %s: %w", instance.ID, err)
+		}
+		fmt.Fprintln(stdout, "Lighting off")
+	}
+	return nil
+}
+
+func selectDevice(found []devices.Instance, id string) (devices.Instance, error) {
+	if id != "" {
+		for _, instance := range found {
+			if instance.ID == id {
+				return instance, nil
+			}
+		}
+		return devices.Instance{}, fmt.Errorf("%w: device ID %q (run info to list device IDs)", devices.ErrNotFound, id)
+	}
+	switch len(found) {
+	case 0:
+		return devices.Instance{}, devices.ErrNotFound
+	case 1:
+		return found[0], nil
+	default:
+		return devices.Instance{}, errors.New("multiple RGB devices found; run info to list device IDs and select one with --device <id>")
 	}
 }
 
@@ -173,14 +246,14 @@ func runAutomaticWithReady(ctx context.Context, debug bool, fallbackWriter io.Wr
 	appLogger.Laylit.Infof("starting automatic mode; config=%s", configPath)
 	debugf, debugWriter := automaticDiagnostics(debug)
 
-	transport := hid.NewWindowsTransport()
-	provider := evision.NewProvider(transport, evision.Options{Debug: debug, DebugWriter: debugWriter})
-	registry := devices.NewRegistry(provider)
 	runtime := app.Runtime{
-		Layouts: windowslayouts.NewSourceWithDebug(debugf), Config: config.NewFileRepository(configPath), Devices: registry,
-		ReportError: func(err error) { appLogger.Laylit.Warnf("runtime warning: %v", err) },
-		Tracef:      debugf,
-		Ready:       ready,
+		Layouts: windowslayouts.NewSourceWithDebug(debugf), Config: config.NewFileRepository(configPath),
+		Devices:      newDeviceRegistry(debug, debugWriter, debugf),
+		WatchDevices: func() (app.DeviceSubscription, error) { return devices.SubscribeWindows() },
+		ReportError:  func(err error) { appLogger.Laylit.Warnf("runtime warning: %v", err) },
+		Infof:        appLogger.Laylit.Infof,
+		Tracef:       debugf,
+		Ready:        ready,
 	}
 	if err := runtime.Run(ctx); err != nil {
 		appLogger.Laylit.Errorf("automatic mode stopped: %v", err)
@@ -233,12 +306,15 @@ func applicationLogDirectoryForExecutable(executable string) string {
 }
 
 func printInfo(ctx context.Context, writer io.Writer, registry *devices.Registry) error {
-	inspections, err := registry.Inspect(ctx)
-	if err != nil {
-		return err
+	discovery, err := registry.Discover(ctx)
+	for _, instance := range discovery.Devices {
+		fmt.Fprintf(writer, "RGB device: %s\nDevice ID: %s\n", instance.Name, instance.ID)
 	}
-	found := 0
-	for _, inspection := range inspections {
+	found := len(discovery.Devices)
+	for _, inspection := range discovery.Inspections {
+		if inspection.Description == "" {
+			continue
+		}
 		fmt.Fprintf(writer, "Found %d %s\n", len(inspection.Collections), inspection.Description)
 		found += len(inspection.Collections)
 		for index, info := range inspection.Collections {
@@ -260,12 +336,12 @@ func printInfo(ctx context.Context, writer io.Writer, registry *devices.Registry
 		}
 	}
 	if found == 0 {
-		if len(inspections) > 0 && inspections[0].NotFoundMessage != "" {
-			return errors.New(inspections[0].NotFoundMessage)
+		if len(discovery.Inspections) > 0 && discovery.Inspections[0].NotFoundMessage != "" {
+			return errors.Join(err, fmt.Errorf("%w: %s", devices.ErrNotFound, discovery.Inspections[0].NotFoundMessage))
 		}
-		return devices.ErrNotFound
+		return errors.Join(err, devices.ErrNotFound)
 	}
-	return nil
+	return err
 }
 
 func textOrNA(value string) string {

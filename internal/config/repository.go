@@ -62,6 +62,10 @@ func (repository *FileRepository) Save(ctx context.Context, value Config) error 
 	if err := Validate(value); err != nil {
 		return fmt.Errorf("validate config before save: %w", err)
 	}
+	value.Version = CurrentVersion
+	if value.Devices == nil {
+		value.Devices = make(map[string]DeviceSettings)
+	}
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
