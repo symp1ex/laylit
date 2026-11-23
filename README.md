@@ -281,3 +281,9 @@ Stop/Shutdown cancellation and wait behavior.
   keyboard layouts such as EN/RU use stable HKL identifiers; unusual IME/TSF
   profiles require integration testing.
 - Only static hardware color and protocol-defined off are implemented.
+
+## Licensing
+
+Laylit is licensed under the [MIT License](LICENSE). Include both `LICENSE`
+and [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt) with every package that
+distributes a Laylit executable, including the console build.
