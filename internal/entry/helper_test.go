@@ -2,6 +2,7 @@ package entry
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -10,6 +11,42 @@ import (
 	appLogger "laylit/internal/logger"
 	"laylit/internal/sessionipc"
 )
+
+func TestSessionHelperSendsRuntimeFailureBeforeClosingPipe(t *testing.T) {
+	service, helper := net.Pipe()
+	defer service.Close()
+	if err := service.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	startErr := errors.New("save reconciled layout config: access denied")
+	done := make(chan error, 1)
+	go func() {
+		done <- serveSessionHelper(helper, "token", 42, nil, func(context.Context, func() error) error {
+			return startErr
+		})
+	}()
+
+	hello, err := sessionipc.ReadFrame(service)
+	if err != nil || hello.Type != sessionipc.TypeHello {
+		t.Fatalf("hello = %+v, %v", hello, err)
+	}
+	frame, err := sessionipc.ReadFrame(service)
+	if err != nil || frame.Type != sessionipc.TypeLog {
+		t.Fatalf("runtime failure frame = %+v, %v", frame, err)
+	}
+	meta, err := sessionipc.DecodeMetadata[sessionipc.LogMeta](frame)
+	if err != nil || meta.Level != "error" || !strings.Contains(meta.Message, startErr.Error()) {
+		t.Fatalf("runtime failure log = %+v, %v", meta, err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, startErr) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("helper did not exit after sending the error")
+	}
+}
 
 func TestSessionHelperStopCancelsAndWaitsForAutomaticRuntime(t *testing.T) {
 	service, helper := net.Pipe()

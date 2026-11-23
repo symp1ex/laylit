@@ -2,6 +2,8 @@ package devices
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -11,6 +13,12 @@ import (
 )
 
 const ATKInstanceID = `ACPI\PNP0C14\ATK`
+
+const (
+	notifyAllDeviceInstances = 0x2
+	notifyDeviceInstance     = 2
+	maxDeviceIDLength        = 200
+)
 
 var (
 	notificationDLL        = windows.NewLazySystemDLL("cfgmgr32.dll")
@@ -26,10 +34,26 @@ type notificationFilter struct {
 	flags      uint32
 	filterType uint32
 	reserved   uint32
-	data       [200]uint16
+	data       [maxDeviceIDLength]uint16
 }
 
-func deviceNotification(_ uintptr, key uintptr, _ uintptr, _ uintptr, _ uintptr) uintptr {
+type notificationEventData struct {
+	filterType uint32
+	reserved   uint32
+	instanceID uint16 // First element of the variable-length DeviceInstance payload.
+}
+
+func deviceNotification(_ uintptr, key uintptr, _ uintptr, event *notificationEventData, size uintptr) uintptr {
+	if event == nil || size < unsafe.Offsetof(event.instanceID) {
+		return 0
+	}
+	if event.filterType == notifyDeviceInstance {
+		length := min((size-unsafe.Offsetof(event.instanceID))/2, maxDeviceIDLength)
+		instanceID := windows.UTF16ToString(unsafe.Slice(&event.instanceID, length))
+		if !strings.EqualFold(instanceID, ATKInstanceID) {
+			return 0
+		}
+	}
 	if entry, ok := notificationChannels.Load(key); ok {
 		select {
 		case entry.(chan struct{}) <- struct{}{}:
@@ -57,13 +81,16 @@ func SubscribeWindows() (*WindowsNotifications, error) {
 		Data1: 0x4D1E55B2, Data2: 0xF16F, Data3: 0x11CF,
 		Data4: [8]byte{0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30},
 	}
-	atk := notificationFilter{size: hid.size, filterType: 2}
-	instance, _ := windows.UTF16FromString(ATKInstanceID)
-	copy(atk.data[:], instance)
-	for index, filter := range []*notificationFilter{&hid, &atk} {
-		result, _, _ := registerNotification.Call(uintptr(unsafe.Pointer(filter)), sub.key, notificationCallback, uintptr(unsafe.Pointer(&sub.handles[index])))
+	// Registering a particular instance fails if its devnode does not exist.
+	// Match ATK in the callback so the same watcher works on other PCs.
+	instances := notificationFilter{size: hid.size, flags: notifyAllDeviceInstances, filterType: notifyDeviceInstance}
+	for index, registration := range []struct {
+		name   string
+		filter *notificationFilter
+	}{{"HID interfaces", &hid}, {"device instances", &instances}} {
+		result, _, _ := registerNotification.Call(uintptr(unsafe.Pointer(registration.filter)), sub.key, notificationCallback, uintptr(unsafe.Pointer(&sub.handles[index])))
 		if result != 0 {
-			return nil, errors.Join(windows.CONFIGRET(result), sub.Close())
+			return nil, errors.Join(fmt.Errorf("CM_Register_Notification for %s: %w", registration.name, windows.CONFIGRET(result)), sub.Close())
 		}
 	}
 	return sub, nil

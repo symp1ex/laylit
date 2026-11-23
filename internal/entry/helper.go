@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"laylit/internal/logger"
 	"laylit/internal/logsettings"
@@ -93,6 +94,21 @@ func serveSessionHelper(connection helperConnection, nonce string, sessionID uin
 
 	select {
 	case runtimeErr := <-runtimeDone:
+		if runtimeErr != nil {
+			// Queued diagnostics can be dropped when the lifecycle pipe closes.
+			// Send the final error through the existing log frame before closing.
+			logCtx, cancelLog := context.WithTimeout(ctx, 500*time.Millisecond)
+			frame, err := sessionipc.NewFrame(sessionipc.TypeLog, 0, 0, sessionipc.LogMeta{
+				Level: "error", Message: fmt.Sprintf("automatic mode stopped: %v", runtimeErr),
+			}, nil)
+			if err == nil {
+				err = conn.SendContext(logCtx, frame)
+			}
+			cancelLog()
+			if err != nil {
+				runtimeErr = errors.Join(runtimeErr, fmt.Errorf("send automatic mode error: %w", err))
+			}
+		}
 		_ = conn.Close()
 		<-serveDone
 		return runtimeErr

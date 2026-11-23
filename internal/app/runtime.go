@@ -67,17 +67,20 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 	}
 
 	var deviceEvents <-chan struct{}
+	pollDevices := false
 	if runtime.WatchDevices != nil {
 		notifications, err := runtime.WatchDevices()
 		if err != nil {
-			return fmt.Errorf("subscribe to Windows device changes: %w", err)
+			runtime.report(fmt.Errorf("subscribe to Windows device changes; using periodic discovery: %w", err))
+			pollDevices = true
+		} else {
+			defer func() {
+				if err := notifications.Close(); err != nil {
+					returnErr = errors.Join(returnErr, fmt.Errorf("close device subscription: %w", err))
+				}
+			}()
+			deviceEvents = notifications.Events()
 		}
-		defer func() {
-			if err := notifications.Close(); err != nil {
-				returnErr = errors.Join(returnErr, fmt.Errorf("close device subscription: %w", err))
-			}
-		}()
-		deviceEvents = notifications.Events()
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -155,7 +158,8 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 				startScan()
 			} else {
 				deviceEvents = nil
-				runtime.report(errors.New("Windows device subscription stopped unexpectedly"))
+				pollDevices = true
+				runtime.report(errors.New("Windows device subscription stopped unexpectedly; using periodic discovery"))
 			}
 		case result := <-scanning:
 			scanning = nil
@@ -168,7 +172,7 @@ func (runtime *Runtime) Run(ctx context.Context) (returnErr error) {
 			}
 			runtime.reconcileDevices(ctx, workers, retiring, result.discovery.Devices, settings, active)
 		case <-retry.C:
-			if discoveryErr != nil && scanning == nil {
+			if (discoveryErr != nil || pollDevices) && scanning == nil {
 				startScan()
 			}
 		case layout, ok := <-events:

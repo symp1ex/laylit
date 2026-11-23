@@ -256,7 +256,9 @@ func runAutomaticWithReady(ctx context.Context, debug bool, fallbackWriter io.Wr
 		Ready:        ready,
 	}
 	if err := runtime.Run(ctx); err != nil {
-		appLogger.Laylit.Errorf("automatic mode stopped: %v", err)
+		if ready == nil {
+			appLogger.Laylit.Errorf("automatic mode stopped: %v", err)
+		}
 		return err
 	}
 	appLogger.Laylit.Infof("automatic mode stopped")

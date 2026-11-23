@@ -130,6 +130,41 @@ func TestRuntimeHotplugFromZeroAndBack(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiscoversKeyboardsWhenWindowsNotificationsFail(t *testing.T) {
+	discovery := &fakeDiscovery{}
+	ready := make(chan struct{})
+	warnings := make(chan error, 1)
+	watchErr := errors.New("CM_Register_Notification failed")
+	startRuntime(t, &Runtime{
+		Layouts: newFakeSource("en"), Config: configuredRepository(), Devices: discovery,
+		WatchDevices: func() (DeviceSubscription, error) { return nil, watchErr },
+		ReportError:  func(err error) { warnings <- err },
+		Ready:        func() error { close(ready); return nil },
+	})
+	await(t, ready)
+	select {
+	case err := <-warnings:
+		if !errors.Is(err, watchErr) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification failure was not reported")
+	}
+
+	device := newFakeDevice()
+	discovery.mu.Lock()
+	discovery.devices = []devices.Instance{fakeInstance("keyboard", device)}
+	discovery.mu.Unlock()
+	select {
+	case got := <-device.applied:
+		if want := (color.RGB{R: 1, G: 2, B: 3}); got != want {
+			t.Fatalf("applied color = %v, want %v", got, want)
+		}
+	case <-time.After(2 * deviceRetryDelay):
+		t.Fatal("periodic discovery did not apply the current layout color")
+	}
+}
+
 type fakeDiscovery struct {
 	mu      sync.Mutex
 	devices []devices.Instance
